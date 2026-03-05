@@ -5,7 +5,8 @@
 ![MCP SDK](https://img.shields.io/badge/MCP_SDK-1.12-blue?logo=anthropic&logoColor=white)
 ![SSH2](https://img.shields.io/badge/SSH2-1.16-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-0.3.0-green)
+[![npm](https://img.shields.io/npm/v/s01-ssh-mcp)](https://www.npmjs.com/package/s01-ssh-mcp)
+![Version](https://img.shields.io/badge/Version-0.3.1-green)
 
 [Leer en Espa\u00f1ol](README.es.md)
 
@@ -159,7 +160,26 @@ npm start
 
 ### 4. MCP Configuration (Claude Desktop)
 
-Add to your Claude Desktop config (`claude_desktop_config.json`):
+**Option A: Using npx (recommended)**
+
+No local installation required — just add to your Claude Desktop config (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "ssh": {
+      "command": "npx",
+      "args": ["-y", "s01-ssh-mcp"],
+      "env": {
+        "SSH_PASSWORD_PRODUCTION": "your_password",
+        "SSH_PASSWORD_STAGING": "your_password"
+      }
+    }
+  }
+}
+```
+
+**Option B: Local installation**
 
 ```json
 {
