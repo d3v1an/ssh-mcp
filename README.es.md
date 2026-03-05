@@ -5,7 +5,7 @@
 ![MCP SDK](https://img.shields.io/badge/MCP_SDK-1.12-blue?logo=anthropic&logoColor=white)
 ![SSH2](https://img.shields.io/badge/SSH2-1.16-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-0.2.0-green)
+![Version](https://img.shields.io/badge/Version-0.3.0-green)
 
 [Read in English](README.md)
 
