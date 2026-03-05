@@ -13,7 +13,8 @@ import dotenv from "dotenv";
 import { tools } from "./tools.js";
 import { getProfile, listProfiles } from "./profiles.js";
 import { isDangerousCommand, AuditLogger } from "./security.js";
-import { PromptResponse, ShellSession } from "./types.js";
+import { PromptResponse, ShellSession, CommandRecord, ReverseInfo } from "./types.js";
+import * as fs from "fs";
 
 dotenv.config();
 
@@ -26,6 +27,8 @@ class SSHMCPServer {
   private auditLogger: AuditLogger;
   private shellSessions: Map<string, ShellSession> = new Map();
   private sessionCounter = 0;
+  private commandHistory: CommandRecord[] = [];
+  private recordCounter = 0;
 
   private static readonly EXEC_TIMEOUT = 30_000;
   private static readonly SETTLE_TIMEOUT = 2_000;
@@ -81,6 +84,10 @@ class SSHMCPServer {
             return await this.handleShellRead(args);
           case "ssh_shell_close":
             return await this.handleShellClose(args);
+          case "ssh_history":
+            return this.handleHistory(args);
+          case "ssh_undo":
+            return await this.handleUndo(args);
           default:
             throw new Error(`Tool desconocido: ${name}`);
         }
@@ -117,6 +124,8 @@ class SSHMCPServer {
         this.sshClient = client;
         this.currentProfile = profileName;
         this.connectedAt = new Date();
+        this.commandHistory = [];
+        this.recordCounter = 0;
 
         this.audit("ssh_connect", `profile=${profileName}`, "ok");
 
@@ -162,6 +171,8 @@ class SSHMCPServer {
     this.sshClient = null;
     this.currentProfile = null;
     this.connectedAt = null;
+    this.commandHistory = [];
+    this.recordCounter = 0;
 
     this.audit("ssh_disconnect", `profile=${profileName}`, "ok");
 
@@ -221,6 +232,7 @@ class SSHMCPServer {
     try {
       const output = await this.execCommand(command);
       this.audit("ssh_exec", command, "ok");
+      this.recordOperation("ssh_exec", { command, confirm }, output, false);
       return {
         content: [{ type: "text", text: output || "(sin salida)" }],
       };
@@ -235,6 +247,15 @@ class SSHMCPServer {
     this.requireConnection();
     const { localPath, remotePath } = args as { localPath: string; remotePath: string };
 
+    // Capturar estado previo antes de subir
+    let previousContent: string | undefined;
+    let previousExisted = true;
+    try {
+      previousContent = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
+    } catch {
+      previousExisted = false;
+    }
+
     const sftp = await this.getSftp();
 
     return new Promise<CallToolResult>((resolve, reject) => {
@@ -244,6 +265,30 @@ class SSHMCPServer {
           reject(new Error(`Error subiendo archivo: ${err.message}`));
         } else {
           this.audit("ssh_upload", `${localPath} -> ${remotePath}`, "ok");
+
+          const reverseInfo: ReverseInfo = previousExisted
+            ? {
+                type: "file_restore",
+                description: `Restaurar contenido previo de ${remotePath}`,
+                remotePath,
+                previousContent,
+                previousExisted: true,
+              }
+            : {
+                type: "file_delete",
+                description: `Eliminar ${remotePath} (no existía antes)`,
+                remotePath,
+                previousExisted: false,
+              };
+
+          this.recordOperation(
+            "ssh_upload",
+            { localPath, remotePath },
+            `Archivo subido: ${localPath} -> ${remotePath}`,
+            true,
+            reverseInfo
+          );
+
           resolve({
             content: [
               { type: "text", text: `Archivo subido: ${localPath} -> ${remotePath}` },
@@ -267,6 +312,19 @@ class SSHMCPServer {
           reject(new Error(`Error descargando archivo: ${err.message}`));
         } else {
           this.audit("ssh_download", `${remotePath} -> ${localPath}`, "ok");
+
+          this.recordOperation(
+            "ssh_download",
+            { remotePath, localPath },
+            `Archivo descargado: ${remotePath} -> ${localPath}`,
+            true,
+            {
+              type: "local_file_delete",
+              description: `Eliminar archivo local descargado: ${localPath}`,
+              localPath,
+            }
+          );
+
           resolve({
             content: [
               { type: "text", text: `Archivo descargado: ${remotePath} -> ${localPath}` },
@@ -310,6 +368,7 @@ class SSHMCPServer {
     try {
       const content = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
       this.audit("ssh_read_file", remotePath, "ok");
+      this.recordOperation("ssh_read_file", { path: remotePath }, `(${content.length} bytes leídos)`, false);
       return {
         content: [{ type: "text", text: content }],
       };
@@ -324,6 +383,15 @@ class SSHMCPServer {
     this.requireConnection();
     const { path: remotePath, content } = args as { path: string; content: string };
 
+    // Capturar estado previo antes de escribir
+    let previousContent: string | undefined;
+    let previousExisted = true;
+    try {
+      previousContent = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
+    } catch {
+      previousExisted = false;
+    }
+
     const sftp = await this.getSftp();
 
     return new Promise<CallToolResult>((resolve, reject) => {
@@ -331,6 +399,30 @@ class SSHMCPServer {
 
       stream.on("close", () => {
         this.audit("ssh_write_file", remotePath, "ok");
+
+        const reverseInfo: ReverseInfo = previousExisted
+          ? {
+              type: "file_restore",
+              description: `Restaurar contenido previo de ${remotePath}`,
+              remotePath,
+              previousContent,
+              previousExisted: true,
+            }
+          : {
+              type: "file_delete",
+              description: `Eliminar ${remotePath} (no existía antes)`,
+              remotePath,
+              previousExisted: false,
+            };
+
+        this.recordOperation(
+          "ssh_write_file",
+          { path: remotePath, content: `(${content.length} bytes)` },
+          `Archivo escrito: ${remotePath} (${content.length} bytes)`,
+          true,
+          reverseInfo
+        );
+
         resolve({
           content: [
             { type: "text", text: `Archivo escrito: ${remotePath} (${content.length} bytes)` },
@@ -408,8 +500,10 @@ class SSHMCPServer {
           settled = true;
           cleanup();
           this.audit("ssh_exec_interactive", `${command} responses=[${auditResponses}]`, "ok");
+          const cleanOutput = stripAnsi(output) || "(sin salida)";
+          this.recordOperation("ssh_exec_interactive", { command, responses: responses.length }, cleanOutput, false);
           resolve({
-            content: [{ type: "text", text: stripAnsi(output) || "(sin salida)" }],
+            content: [{ type: "text", text: cleanOutput }],
           });
         };
 
@@ -641,6 +735,166 @@ class SSHMCPServer {
     return {
       content: [{ type: "text", text: `Sesión "${sessionId}" cerrada.` }],
     };
+  }
+
+  // --- History & Undo handlers ---
+
+  private recordOperation(
+    tool: string,
+    params: Record<string, unknown>,
+    output: string,
+    reversible: boolean,
+    reverseInfo?: ReverseInfo
+  ): void {
+    this.commandHistory.push({
+      id: ++this.recordCounter,
+      timestamp: new Date().toISOString(),
+      tool,
+      params,
+      output,
+      reversible,
+      reversed: false,
+      reverseInfo,
+    });
+  }
+
+  private handleHistory(args: any): CallToolResult {
+    this.requireConnection();
+    const filter = (args?.filter as string) || "all";
+    const limit = (args?.limit as number) || 20;
+
+    let records = [...this.commandHistory];
+
+    if (filter === "reversible") {
+      records = records.filter((r) => r.reversible && !r.reversed);
+    } else if (filter === "reversed") {
+      records = records.filter((r) => r.reversed);
+    }
+
+    records = records.slice(-limit);
+
+    if (records.length === 0) {
+      return {
+        content: [{ type: "text", text: "No hay operaciones en el historial con el filtro aplicado." }],
+      };
+    }
+
+    const lines = records.map((r) => {
+      const status = r.reversed ? " [REVERTIDA]" : r.reversible ? " [reversible]" : "";
+      const params = Object.entries(r.params)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      return `#${r.id} [${r.timestamp}] ${r.tool}(${params})${status}`;
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `Historial de operaciones (${records.length}/${this.commandHistory.length} total):`,
+            "",
+            ...lines,
+          ].join("\n"),
+        },
+      ],
+    };
+  }
+
+  private async handleUndo(args: any): Promise<CallToolResult> {
+    this.requireConnection();
+    const recordId = args.recordId as number;
+    const confirm = args.confirm as boolean | undefined;
+
+    const record = this.commandHistory.find((r) => r.id === recordId);
+    if (!record) {
+      throw new Error(`Registro #${recordId} no encontrado en el historial.`);
+    }
+
+    if (!record.reversible) {
+      throw new Error(`Registro #${recordId} (${record.tool}) no es reversible.`);
+    }
+
+    if (record.reversed) {
+      throw new Error(`Registro #${recordId} ya fue revertido.`);
+    }
+
+    if (!record.reverseInfo) {
+      throw new Error(`Registro #${recordId} no tiene información de reversión.`);
+    }
+
+    if (!confirm) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Operación a revertir:`,
+              `  #${record.id} ${record.tool} — ${record.reverseInfo.description}`,
+              ``,
+              `Para confirmar, reenvía con confirm: true.`,
+            ].join("\n"),
+          },
+        ],
+      };
+    }
+
+    const info = record.reverseInfo;
+
+    switch (info.type) {
+      case "file_restore": {
+        const sftp = await this.getSftp();
+        await new Promise<void>((resolve, reject) => {
+          const stream = sftp.createWriteStream(info.remotePath!);
+          stream.on("close", () => resolve());
+          stream.on("error", (err: Error) => reject(err));
+          stream.end(info.previousContent!, "utf-8");
+        });
+        record.reversed = true;
+        this.audit("ssh_undo", `record=${recordId} file_restore ${info.remotePath}`, "ok");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Revertido #${recordId}: contenido previo restaurado en ${info.remotePath}`,
+            },
+          ],
+        };
+      }
+
+      case "file_delete": {
+        await this.execCommand(`rm ${escapeShellArg(info.remotePath!)}`);
+        record.reversed = true;
+        this.audit("ssh_undo", `record=${recordId} file_delete ${info.remotePath}`, "ok");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Revertido #${recordId}: archivo ${info.remotePath} eliminado (no existía antes)`,
+            },
+          ],
+        };
+      }
+
+      case "local_file_delete": {
+        if (fs.existsSync(info.localPath!)) {
+          fs.unlinkSync(info.localPath!);
+        }
+        record.reversed = true;
+        this.audit("ssh_undo", `record=${recordId} local_file_delete ${info.localPath}`, "ok");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Revertido #${recordId}: archivo local ${info.localPath} eliminado`,
+            },
+          ],
+        };
+      }
+
+      default:
+        throw new Error(`Tipo de reversión desconocido: ${(info as ReverseInfo).type}`);
+    }
   }
 
   // --- Shell session lifecycle helpers ---

@@ -272,4 +272,43 @@ export const tools: Tool[] = [
       required: ["sessionId"],
     },
   },
+  {
+    name: "ssh_history",
+    description:
+      "Muestra el historial de operaciones ejecutadas durante la conexión activa. Permite filtrar por tipo de operación y limitar resultados",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filter: {
+          type: "string",
+          enum: ["all", "reversible", "reversed"],
+          description:
+            "Filtro del historial: 'all' (todas), 'reversible' (solo reversibles), 'reversed' (solo revertidas). Default: 'all'",
+        },
+        limit: {
+          type: "number",
+          description: "Número máximo de registros a retornar (default: 20)",
+        },
+      },
+    },
+  },
+  {
+    name: "ssh_undo",
+    description:
+      "Revierte una operación específica del historial usando su ID. Solo funciona con operaciones marcadas como reversibles (ssh_write_file, ssh_upload, ssh_download). Requiere confirm: true para ejecutar la reversión",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recordId: {
+          type: "number",
+          description: "ID del registro de operación a revertir (obtenido de ssh_history)",
+        },
+        confirm: {
+          type: "boolean",
+          description: "Confirmar la reversión de la operación",
+        },
+      },
+      required: ["recordId"],
+    },
+  },
 ];

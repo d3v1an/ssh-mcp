@@ -27,3 +27,23 @@ export interface ShellSession {
   lastActivity: Date;
   idleTimer: ReturnType<typeof setTimeout>;
 }
+
+export interface ReverseInfo {
+  type: "file_restore" | "file_delete" | "local_file_delete";
+  description: string;
+  remotePath?: string;
+  localPath?: string;
+  previousContent?: string;
+  previousExisted?: boolean;
+}
+
+export interface CommandRecord {
+  id: number;
+  timestamp: string;
+  tool: string;
+  params: Record<string, unknown>;
+  output: string;
+  reversible: boolean;
+  reversed: boolean;
+  reverseInfo?: ReverseInfo;
+}
