@@ -27,7 +27,7 @@ class SSHMCPServer {
   constructor() {
     this.auditLogger = new AuditLogger();
     this.server = new Server(
-      { name: "ssh-mcp-server", version: "1.0.0" },
+      { name: "ssh-mcp-server", version: "0.1.0" },
       { capabilities: { tools: {} } }
     );
     this.setupHandlers();

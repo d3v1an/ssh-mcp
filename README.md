@@ -5,7 +5,7 @@
 ![MCP SDK](https://img.shields.io/badge/MCP_SDK-1.12-blue?logo=anthropic&logoColor=white)
 ![SSH2](https://img.shields.io/badge/SSH2-1.16-orange)
 ![License](https://img.shields.io/badge/License-Private-red)
-![Version](https://img.shields.io/badge/Version-1.0.0-green)
+![Version](https://img.shields.io/badge/Version-0.1.0-green)
 
 MCP server para administración remota de servidores via SSH. Soporta múltiples perfiles, ejecución de comandos, transferencia de archivos (SFTP), y detección de comandos destructivos con audit log.
 
