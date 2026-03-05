@@ -3,6 +3,30 @@
   "version": "0.3.0",
   "description": "MCP Server for SSH remote server administration",
   "main": "dist/index.js",
+  "bin": {
+    "s01-ssh-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "profiles.json",
+    ".env.example",
+    "README.md",
+    "README.es.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/d3v1an/ssh-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "ssh",
+    "remote",
+    "server",
+    "sftp",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "tsc",
