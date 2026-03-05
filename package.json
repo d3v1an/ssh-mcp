@@ -1,6 +1,6 @@
 {
   "name": "s01-ssh-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP Server for SSH remote server administration",
   "main": "dist/index.js",
   "type": "module",
