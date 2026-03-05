@@ -12,3 +12,18 @@ export interface AuditEntry {
   params: string;
   result: "ok" | "error";
 }
+
+export interface PromptResponse {
+  prompt: string;
+  answer: string;
+  sensitive?: boolean;
+}
+
+export interface ShellSession {
+  id: string;
+  channel: import("ssh2").ClientChannel;
+  buffer: string;
+  createdAt: Date;
+  lastActivity: Date;
+  idleTimer: ReturnType<typeof setTimeout>;
+}
