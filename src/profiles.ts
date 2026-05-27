@@ -17,6 +17,7 @@ interface ProfilesFile {
 }
 
 let profilesCache: ProfilesFile | null = null;
+const privateKeyCache = new Map<string, Buffer>();
 
 function getProfilesPath(): string {
   return process.env.SSH_PROFILES_PATH || join(process.cwd(), "profiles.json");
@@ -78,6 +79,7 @@ export function loadProfiles(): ProfilesFile {
 
   for (const [name, entry] of Object.entries(parsed)) {
     validateProfileEntry(name, entry);
+    privateKeyCache.set(name, readFileSync(expandHome(entry.privateKeyPath)));
   }
 
   profilesCache = parsed;
@@ -93,13 +95,9 @@ export function getProfile(name: string): SSHProfile {
     );
   }
 
-  const keyPath = expandHome(profile.privateKeyPath);
-  let privateKey: Buffer;
-  try {
-    privateKey = readFileSync(keyPath);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`No se pudo leer la llave privada para "${name}" en ${keyPath}: ${msg}`);
+  const privateKey = privateKeyCache.get(name);
+  if (!privateKey) {
+    throw new Error(`Clave privada para perfil "${name}" no encontrada en caché`);
   }
 
   const passphrase = process.env[`SSH_PASSPHRASE_${name.toUpperCase()}`];

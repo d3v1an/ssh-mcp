@@ -1,4 +1,4 @@
-import { appendFileSync, openSync, closeSync } from "fs";
+import { createWriteStream, WriteStream, chmodSync } from "fs";
 import { join } from "path";
 import { AuditEntry } from "./types.js";
 
@@ -54,26 +54,22 @@ export function isDangerousCommand(cmd: string): { dangerous: boolean; reason: s
 }
 
 export class AuditLogger {
-  private logPath: string;
+  private stream: WriteStream;
 
   constructor(logPath?: string) {
-    this.logPath = logPath || join(process.cwd(), "audit.log");
-    // Ensure file exists with restrictive permissions (owner read/write only)
-    try {
-      const fd = openSync(this.logPath, "a", 0o600);
-      closeSync(fd);
-    } catch {
-      // Silently ignore — audit writes will also fail silently below
-    }
+    const path = logPath || join(process.cwd(), "audit.log");
+    try { chmodSync(path, 0o600); } catch { /* file may not exist yet */ }
+    this.stream = createWriteStream(path, {
+      flags: "a",
+      mode: 0o600,
+      encoding: "utf-8",
+    });
+    this.stream.on("error", () => {});
   }
 
   log(entry: AuditEntry): void {
     const params = redactSensitive(entry.params);
     const line = `[${entry.timestamp}] [${entry.profile}] [${entry.tool}] [${params}] [RESULT: ${entry.result}]\n`;
-    try {
-      appendFileSync(this.logPath, line, "utf-8");
-    } catch {
-      // Silently fail on audit log write errors to not disrupt operations
-    }
+    this.stream.write(line);
   }
 }

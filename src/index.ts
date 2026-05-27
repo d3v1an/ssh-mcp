@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
   CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Client, SFTPWrapper } from "ssh2";
+import { Client, ClientChannel, SFTPWrapper } from "ssh2";
 import dotenv from "dotenv";
 import { createRequire } from "module";
 import { resolve, sep } from "path";
@@ -282,13 +282,15 @@ class SSHMCPServer {
 
     this.validateLocalPath(localPath);
 
-    // Capture previous remote state for undo
+    // Check remote file size before reading for undo backup
+    const remoteSize = await this.getRemoteFileSize(remotePath);
     let previousContent: string | undefined;
-    let previousExisted = true;
-    try {
-      previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
-    } catch {
-      previousExisted = false;
+    const previousExisted = remoteSize !== null;
+
+    if (previousExisted && remoteSize! <= SSHMCPServer.MAX_PREV_CONTENT) {
+      try {
+        previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
+      } catch { /* content unavailable — undo won't restore */ }
     }
 
     const sftp = await this.getSftp();
@@ -341,6 +343,16 @@ class SSHMCPServer {
 
     this.validateLocalPath(localPath);
 
+    let localPreviousContent: string | undefined;
+    let localFileExisted = false;
+    try {
+      const stat = fs.statSync(localPath);
+      localFileExisted = true;
+      if (stat.size <= SSHMCPServer.MAX_PREV_CONTENT) {
+        localPreviousContent = fs.readFileSync(localPath, "utf-8");
+      }
+    } catch { /* file doesn't exist */ }
+
     const sftp = await this.getSftp();
 
     return new Promise<CallToolResult>((resolve, reject) => {
@@ -351,16 +363,25 @@ class SSHMCPServer {
         } else {
           this.audit("ssh_download", `${remotePath} -> ${localPath}`, "ok");
 
+          const reverseInfo: ReverseInfo = localFileExisted
+            ? {
+                type: "local_file_restore",
+                description: `Restaurar contenido previo de ${localPath}`,
+                localPath,
+                previousContent: localPreviousContent,
+              }
+            : {
+                type: "local_file_delete",
+                description: `Eliminar archivo local descargado: ${localPath}`,
+                localPath,
+              };
+
           this.recordOperation(
             "ssh_download",
             { remotePath, localPath },
             `Archivo descargado: ${remotePath} -> ${localPath}`,
-            true,
-            {
-              type: "local_file_delete",
-              description: `Eliminar archivo local descargado: ${localPath}`,
-              localPath,
-            }
+            localFileExisted ? localPreviousContent !== undefined : true,
+            reverseInfo
           );
 
           resolve({
@@ -402,11 +423,33 @@ class SSHMCPServer {
   private async handleReadFile(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
     const remotePath = requireString(args, "path");
+    const offset = optionalNumber(args, "offset");
+    const limit = optionalNumber(args, "limit");
+
+    if (offset !== undefined && (offset < 1 || !Number.isInteger(offset))) {
+      throw new Error("offset debe ser un entero positivo (línea inicial, base 1)");
+    }
+    if (limit !== undefined && (limit < 1 || !Number.isInteger(limit))) {
+      throw new Error("limit debe ser un entero positivo (número de líneas)");
+    }
+
+    let cmd: string;
+    if (offset !== undefined || limit !== undefined) {
+      const start = offset ?? 1;
+      if (limit !== undefined) {
+        const end = start + limit - 1;
+        cmd = `sed -n '${start},${end}p' -- ${escapeShellArg(remotePath)}`;
+      } else {
+        cmd = `sed -n '${start},$p' -- ${escapeShellArg(remotePath)}`;
+      }
+    } else {
+      cmd = `cat -- ${escapeShellArg(remotePath)}`;
+    }
 
     try {
-      const content = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
+      const content = await this.execCommand(cmd);
       this.audit("ssh_read_file", remotePath, "ok");
-      this.recordOperation("ssh_read_file", { path: remotePath }, `(${content.length} bytes leídos)`, false);
+      this.recordOperation("ssh_read_file", { path: remotePath, offset, limit }, `(${content.length} bytes leídos)`, false);
       return {
         content: [{ type: "text", text: content }],
       };
@@ -422,13 +465,15 @@ class SSHMCPServer {
     const remotePath = requireString(args, "path");
     const content = requireString(args, "content");
 
-    // Capture previous state for undo
+    // Check remote file size before reading for undo backup
+    const remoteSize = await this.getRemoteFileSize(remotePath);
     let previousContent: string | undefined;
-    let previousExisted = true;
-    try {
-      previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
-    } catch {
-      previousExisted = false;
+    const previousExisted = remoteSize !== null;
+
+    if (previousExisted && remoteSize! <= SSHMCPServer.MAX_PREV_CONTENT) {
+      try {
+        previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
+      } catch { /* content unavailable — undo won't restore */ }
     }
 
     const sftp = await this.getSftp();
@@ -484,7 +529,7 @@ class SSHMCPServer {
   private async handleExecInteractive(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
     const command = requireString(args, "command");
-    const responses = ((args as Record<string, unknown>)?.responses ?? []) as PromptResponse[];
+    const responses = this.parseResponses((args as Record<string, unknown>)?.responses);
     const timeout = clampTimeout(optionalNumber(args, "timeout"), SSHMCPServer.EXEC_TIMEOUT);
     const confirm = optionalBoolean(args, "confirm");
 
@@ -563,10 +608,10 @@ class SSHMCPServer {
 
         stream.on("data", (data: Buffer) => {
           const chunk = data.toString();
-          output += chunk;
-
-          if (output.length > SSHMCPServer.MAX_BUFFER) {
-            output = output.slice(-SSHMCPServer.MAX_BUFFER);
+          if (output.length + chunk.length > SSHMCPServer.MAX_BUFFER) {
+            output = (output + chunk).slice(-SSHMCPServer.MAX_BUFFER);
+          } else {
+            output += chunk;
           }
 
           for (const resp of compiledResponses) {
@@ -624,9 +669,11 @@ class SSHMCPServer {
         };
 
         stream.on("data", (data: Buffer) => {
-          session.buffer += data.toString();
-          if (session.buffer.length > SSHMCPServer.MAX_BUFFER) {
-            session.buffer = session.buffer.slice(-SSHMCPServer.MAX_BUFFER);
+          const chunk = data.toString();
+          if (session.buffer.length + chunk.length > SSHMCPServer.MAX_BUFFER) {
+            session.buffer = (session.buffer + chunk).slice(-SSHMCPServer.MAX_BUFFER);
+          } else {
+            session.buffer += chunk;
           }
           session.lastActivity = new Date();
         });
@@ -791,14 +838,17 @@ class SSHMCPServer {
   private handleHistory(args: unknown): CallToolResult {
     this.requireConnection();
     const filter = optionalString(args, "filter") || "all";
-    const limit = optionalNumber(args, "limit") ?? 20;
+    const rawLimit = optionalNumber(args, "limit");
+    const limit = (rawLimit === undefined || rawLimit <= 0) ? 20 : rawLimit;
 
-    let records = [...this.commandHistory];
+    let records: CommandRecord[];
 
     if (filter === "reversible") {
-      records = records.filter((r) => r.reversible && !r.reversed);
+      records = this.commandHistory.filter((r) => r.reversible && !r.reversed);
     } else if (filter === "reversed") {
-      records = records.filter((r) => r.reversed);
+      records = this.commandHistory.filter((r) => r.reversed);
+    } else {
+      records = this.commandHistory;
     }
 
     records = records.slice(-limit);
@@ -926,6 +976,26 @@ class SSHMCPServer {
         };
       }
 
+      case "local_file_restore": {
+        this.validateLocalPath(info.localPath!);
+        if (info.previousContent === undefined) {
+          throw new Error(
+            `Registro #${recordId}: el contenido previo no fue almacenado (archivo demasiado grande). Undo no disponible.`
+          );
+        }
+        fs.writeFileSync(info.localPath!, info.previousContent, "utf-8");
+        record.reversed = true;
+        this.audit("ssh_undo", `record=${recordId} local_file_restore ${info.localPath}`, "ok");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Revertido #${recordId}: contenido previo restaurado en ${info.localPath}`,
+            },
+          ],
+        };
+      }
+
       default:
         throw new Error(`Tipo de reversión desconocido: ${(info as ReverseInfo).type}`);
     }
@@ -998,6 +1068,30 @@ class SSHMCPServer {
     return content;
   }
 
+  private parseResponses(raw: unknown): PromptResponse[] {
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (r): r is PromptResponse =>
+        typeof r === "object" && r !== null &&
+        typeof (r as PromptResponse).prompt === "string" &&
+        typeof (r as PromptResponse).answer === "string"
+    );
+  }
+
+  private async getRemoteFileSize(remotePath: string): Promise<number | null> {
+    try {
+      const sftp = await this.getSftp();
+      return await new Promise<number>((resolve, reject) => {
+        sftp.stat(remotePath, (err, stats) => {
+          if (err) reject(err);
+          else resolve(stats.size);
+        });
+      });
+    } catch {
+      return null;
+    }
+  }
+
   private dangerWarning(command: string, reason: string): CallToolResult {
     return {
       content: [
@@ -1035,28 +1129,39 @@ class SSHMCPServer {
   }
 
   private execCommand(command: string, timeoutMs = SSHMCPServer.EXEC_TIMEOUT): Promise<string> {
+    let timerId: ReturnType<typeof setTimeout>;
+    let execStream: ClientChannel | undefined;
+    let timedOut = false;
+
     const exec = new Promise<string>((resolve, reject) => {
       this.sshClient!.exec(command, (err, stream) => {
         if (err) {
           reject(err);
           return;
         }
+        execStream = stream;
 
-        let stdout = "";
-        let stderr = "";
+        const stdoutChunks: string[] = [];
+        const stderrChunks: string[] = [];
 
         stream.on("data", (data: Buffer) => {
-          stdout += data.toString();
-          if (stdout.length > SSHMCPServer.MAX_BUFFER) {
-            stdout = stdout.slice(-SSHMCPServer.MAX_BUFFER);
-          }
+          stdoutChunks.push(data.toString());
         });
 
         stream.stderr.on("data", (data: Buffer) => {
-          stderr += data.toString();
+          stderrChunks.push(data.toString());
         });
 
         stream.on("close", (code: number) => {
+          let stdout = stdoutChunks.join("");
+          if (stdout.length > SSHMCPServer.MAX_BUFFER) {
+            stdout = stdout.slice(-SSHMCPServer.MAX_BUFFER);
+          }
+          let stderr = stderrChunks.join("");
+          if (stderr.length > SSHMCPServer.MAX_BUFFER) {
+            stderr = stderr.slice(-SSHMCPServer.MAX_BUFFER);
+          }
+
           if (code !== 0 && stderr) {
             reject(new Error(`Exit code ${code}: ${stderr}`));
           } else {
@@ -1066,14 +1171,17 @@ class SSHMCPServer {
       });
     });
 
-    const timer = new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`Timeout ejecutando comando (${timeoutMs}ms)`)),
-        timeoutMs
-      )
-    );
+    const timer = new Promise<never>((_, reject) => {
+      timerId = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`Timeout ejecutando comando (${timeoutMs}ms)`));
+      }, timeoutMs);
+    });
 
-    return Promise.race([exec, timer]);
+    return Promise.race([exec, timer]).finally(() => {
+      clearTimeout(timerId!);
+      if (timedOut) execStream?.destroy();
+    });
   }
 
   private audit(tool: string, params: string, result: "ok" | "error"): void {

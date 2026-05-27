@@ -32,7 +32,7 @@ export interface ShellSession {
 }
 
 export interface ReverseInfo {
-  type: "file_restore" | "file_delete" | "local_file_delete";
+  type: "file_restore" | "file_delete" | "local_file_delete" | "local_file_restore";
   description: string;
   remotePath?: string;
   localPath?: string;

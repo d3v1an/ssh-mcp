@@ -110,13 +110,21 @@ export const tools: Tool[] = [
   },
   {
     name: "ssh_read_file",
-    description: "Lee el contenido de un archivo en el servidor remoto",
+    description: "Lee el contenido de un archivo en el servidor remoto. Soporta lectura parcial con offset/limit",
     inputSchema: {
       type: "object",
       properties: {
         path: {
           type: "string",
           description: "Ruta del archivo a leer en el servidor remoto",
+        },
+        offset: {
+          type: "number",
+          description: "Línea inicial a leer (base 1, default: desde el inicio del archivo)",
+        },
+        limit: {
+          type: "number",
+          description: "Número máximo de líneas a leer (default: todo el archivo)",
         },
       },
       required: ["path"],
