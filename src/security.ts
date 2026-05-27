@@ -22,19 +22,19 @@ const DANGEROUS_PATTERNS: { pattern: RegExp; reason: string }[] = [
 ];
 
 // Redact common secret patterns before writing to audit log
-const REDACT_PATTERNS: { re: RegExp; label: string }[] = [
-  { re: /password\s*=\s*\S+/gi, label: "password=" },
-  { re: /passwd\s*=\s*\S+/gi, label: "passwd=" },
-  { re: /token\s*=\s*\S+/gi, label: "token=" },
-  { re: /secret\s*=\s*\S+/gi, label: "secret=" },
-  { re: /api[_-]?key\s*=\s*\S+/gi, label: "api_key=" },
-  { re: /Authorization:\s*\S+/gi, label: "Authorization:" },
-  { re: /Bearer\s+\S+/gi, label: "Bearer" },
+const REDACT_PATTERNS: RegExp[] = [
+  /password\s*=\s*\S+/gi,
+  /passwd\s*=\s*\S+/gi,
+  /token\s*=\s*\S+/gi,
+  /secret\s*=\s*\S+/gi,
+  /api[_-]?key\s*=\s*\S+/gi,
+  /Authorization:\s*\S+/gi,
+  /Bearer\s+\S+/gi,
 ];
 
 function redactSensitive(text: string): string {
   let result = text;
-  for (const { re } of REDACT_PATTERNS) {
+  for (const re of REDACT_PATTERNS) {
     result = result.replace(re, (match) => {
       const sep = match.indexOf("=") !== -1 ? "=" : ":";
       const idx = match.indexOf(sep);
@@ -71,5 +71,9 @@ export class AuditLogger {
     const params = redactSensitive(entry.params);
     const line = `[${entry.timestamp}] [${entry.profile}] [${entry.tool}] [${params}] [RESULT: ${entry.result}]\n`;
     this.stream.write(line);
+  }
+
+  close(): void {
+    this.stream.end();
   }
 }

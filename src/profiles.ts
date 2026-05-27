@@ -23,7 +23,7 @@ function getProfilesPath(): string {
   return process.env.SSH_PROFILES_PATH || join(process.cwd(), "profiles.json");
 }
 
-export function expandHome(p: string): string {
+function expandHome(p: string): string {
   if (p.startsWith("~/") || p === "~") {
     return join(homedir(), p.slice(1));
   }

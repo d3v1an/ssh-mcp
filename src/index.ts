@@ -16,7 +16,7 @@ import * as fs from "fs";
 import { tools } from "./tools.js";
 import { getProfile, listProfiles } from "./profiles.js";
 import { isDangerousCommand, AuditLogger } from "./security.js";
-import { PromptResponse, ShellSession, CommandRecord, ReverseInfo, AuditEntry } from "./types.js";
+import { PromptResponse, ShellSession, CommandRecord, ReverseInfo } from "./types.js";
 import { formatUptime, padRight, escapeShellArg, stripAnsi } from "./utils.js";
 import {
   requireString,
@@ -61,6 +61,7 @@ class SSHMCPServer {
       { capabilities: { tools: {} } }
     );
     this.setupHandlers();
+    process.on("beforeExit", () => this.auditLogger.close());
   }
 
   private setupHandlers() {
@@ -281,6 +282,9 @@ class SSHMCPServer {
     const remotePath = requireString(args, "remotePath");
 
     this.validateLocalPath(localPath);
+    if (!fs.existsSync(localPath)) {
+      throw new Error(`Archivo local "${localPath}" no encontrado`);
+    }
 
     // Check remote file size before reading for undo backup
     const remoteSize = await this.getRemoteFileSize(remotePath);
@@ -309,13 +313,11 @@ class SSHMCPServer {
                 description: `Restaurar contenido previo de ${remotePath}`,
                 remotePath,
                 previousContent: this.capPrevContent(previousContent),
-                previousExisted: true,
               }
             : {
                 type: "file_delete",
                 description: `Eliminar ${remotePath} (no existía antes)`,
                 remotePath,
-                previousExisted: false,
               };
 
           this.recordOperation(
@@ -403,16 +405,18 @@ class SSHMCPServer {
     return new Promise<CallToolResult>((resolve, reject) => {
       sftp.readdir(path, (err, list) => {
         if (err) {
+          this.audit("ssh_ls", path, "error");
           reject(new Error(`Error listando directorio "${path}": ${err.message}`));
           return;
         }
 
         const entries = list.map((entry) => {
           const type = entry.attrs.isDirectory() ? "d" : entry.attrs.isSymbolicLink() ? "l" : "-";
-          const size = entry.attrs.size;
-          return `${type} ${entry.attrs.uid}:${entry.attrs.gid} ${padRight(String(size), 10)} ${entry.filename}`;
+          const size = entry.attrs.size ?? 0;
+          return `${type} ${entry.attrs.uid ?? "-"}:${entry.attrs.gid ?? "-"} ${padRight(String(size), 10)} ${entry.filename}`;
         });
 
+        this.audit("ssh_ls", path, "ok");
         resolve({
           content: [{ type: "text", text: entries.join("\n") || "(directorio vacío)" }],
         });
@@ -491,13 +495,11 @@ class SSHMCPServer {
               description: `Restaurar contenido previo de ${remotePath}`,
               remotePath,
               previousContent: capped,
-              previousExisted: true,
             }
           : {
               type: "file_delete",
               description: `Eliminar ${remotePath} (no existía antes)`,
               remotePath,
-              previousExisted: false,
             };
 
         this.recordOperation(
@@ -647,8 +649,10 @@ class SSHMCPServer {
       );
     }
 
-    const cols = optionalNumber(args, "cols") ?? 80;
-    const rows = optionalNumber(args, "rows") ?? 24;
+    const rawCols = optionalNumber(args, "cols");
+    const cols = (rawCols === undefined || rawCols <= 0) ? 80 : rawCols;
+    const rawRows = optionalNumber(args, "rows");
+    const rows = (rawRows === undefined || rawRows <= 0) ? 24 : rawRows;
 
     return new Promise<CallToolResult>((resolve, reject) => {
       this.sshClient!.shell({ cols, rows, term: "xterm" }, (err, stream) => {
@@ -663,7 +667,6 @@ class SSHMCPServer {
           id: sessionId,
           channel: stream,
           buffer: "",
-          createdAt: new Date(),
           lastActivity: new Date(),
           idleTimer: this.createIdleTimer(sessionId),
         };
@@ -678,17 +681,21 @@ class SSHMCPServer {
           session.lastActivity = new Date();
         });
 
+        let settleTimer: ReturnType<typeof setTimeout>;
+
         stream.on("close", () => {
+          clearTimeout(settleTimer);
           if (this.shellSessions.has(sessionId)) {
             this.destroyShellSession(sessionId, session);
             this.audit("ssh_shell_close", `sessionId=${sessionId} (channel closed)`, "ok");
           }
+          reject(new Error("Shell cerrada antes de completar inicialización"));
         });
 
         this.shellSessions.set(sessionId, session);
         this.audit("ssh_shell_start", `sessionId=${sessionId}`, "ok");
 
-        setTimeout(() => {
+        settleTimer = setTimeout(() => {
           resolve({
             content: [
               {
@@ -838,8 +845,11 @@ class SSHMCPServer {
   private handleHistory(args: unknown): CallToolResult {
     this.requireConnection();
     const filter = optionalString(args, "filter") || "all";
+    if (!["all", "reversible", "reversed"].includes(filter)) {
+      throw new Error(`Filtro inválido "${filter}". Valores válidos: all, reversible, reversed`);
+    }
     const rawLimit = optionalNumber(args, "limit");
-    const limit = (rawLimit === undefined || rawLimit <= 0) ? 20 : rawLimit;
+    const limit = (rawLimit === undefined || rawLimit <= 0) ? 20 : Math.floor(rawLimit);
 
     let records: CommandRecord[];
 
@@ -1065,17 +1075,27 @@ class SSHMCPServer {
   private capPrevContent(content: string | undefined): string | undefined {
     if (content === undefined) return undefined;
     if (content.length > SSHMCPServer.MAX_PREV_CONTENT) return undefined;
+    if (content.includes("\0")) return undefined;
     return content;
   }
 
   private parseResponses(raw: unknown): PromptResponse[] {
-    if (!Array.isArray(raw)) return [];
-    return raw.filter(
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) {
+      throw new Error("responses debe ser un array");
+    }
+    const valid = raw.filter(
       (r): r is PromptResponse =>
         typeof r === "object" && r !== null &&
         typeof (r as PromptResponse).prompt === "string" &&
         typeof (r as PromptResponse).answer === "string"
     );
+    if (valid.length < raw.length) {
+      throw new Error(
+        `${raw.length - valid.length} entrada(s) en responses son inválidas (requieren campos prompt y answer)`
+      );
+    }
+    return valid;
   }
 
   private async getRemoteFileSize(remotePath: string): Promise<number | null> {
@@ -1143,13 +1163,31 @@ class SSHMCPServer {
 
         const stdoutChunks: string[] = [];
         const stderrChunks: string[] = [];
+        let stdoutLen = 0;
+        let stderrLen = 0;
 
         stream.on("data", (data: Buffer) => {
-          stdoutChunks.push(data.toString());
+          const s = data.toString();
+          stdoutChunks.push(s);
+          stdoutLen += s.length;
+          if (stdoutLen > SSHMCPServer.MAX_BUFFER) {
+            const joined = stdoutChunks.join("");
+            stdoutChunks.length = 0;
+            stdoutChunks.push(joined.slice(-SSHMCPServer.MAX_BUFFER));
+            stdoutLen = stdoutChunks[0].length;
+          }
         });
 
         stream.stderr.on("data", (data: Buffer) => {
-          stderrChunks.push(data.toString());
+          const s = data.toString();
+          stderrChunks.push(s);
+          stderrLen += s.length;
+          if (stderrLen > SSHMCPServer.MAX_BUFFER) {
+            const joined = stderrChunks.join("");
+            stderrChunks.length = 0;
+            stderrChunks.push(joined.slice(-SSHMCPServer.MAX_BUFFER));
+            stderrLen = stderrChunks[0].length;
+          }
         });
 
         stream.on("close", (code: number) => {
@@ -1164,6 +1202,8 @@ class SSHMCPServer {
 
           if (code !== 0 && stderr) {
             reject(new Error(`Exit code ${code}: ${stderr}`));
+          } else if (code !== 0) {
+            resolve(stdout + `\n[exit code: ${code}]`);
           } else {
             resolve(stdout + (stderr ? `\n[stderr]: ${stderr}` : ""));
           }
@@ -1201,7 +1241,7 @@ class SSHMCPServer {
       tool,
       params: `profile=${profile}`,
       result,
-    } as AuditEntry);
+    });
   }
 
   async run() {

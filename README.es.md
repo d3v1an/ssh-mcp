@@ -6,7 +6,7 @@
 ![SSH2](https://img.shields.io/badge/SSH2-1.16-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 [![npm](https://img.shields.io/npm/v/s01-ssh-mcp)](https://www.npmjs.com/package/s01-ssh-mcp)
-![Version](https://img.shields.io/badge/Version-0.4.0-green)
+![Version](https://img.shields.io/badge/Version-0.5.0-green)
 
 [Read in English](README.md)
 
@@ -243,7 +243,7 @@ No requiere instalación local — solo agregar en la configuración de Claude D
 | `ssh_upload` | Subir archivo local al servidor (SFTP) | Sí |
 | `ssh_download` | Descargar archivo del servidor (SFTP) | Sí |
 | `ssh_ls` | Listar directorio remoto (SFTP) | Sí |
-| `ssh_read_file` | Leer contenido de archivo remoto | Sí |
+| `ssh_read_file` | Leer contenido de archivo remoto (soporta lectura parcial con offset/limit) | Sí |
 | `ssh_write_file` | Escribir contenido a archivo remoto (SFTP) | Sí |
 | `ssh_history` | Ver historial de operaciones de la conexión activa | Sí |
 | `ssh_undo` | Revertir una operación específica por su ID | Sí |
@@ -262,7 +262,7 @@ No requiere instalación local — solo agregar en la configuración de Claude D
 | `ssh_upload` | `localPath` (string), `remotePath` (string) | Ambos |
 | `ssh_download` | `remotePath` (string), `localPath` (string) | Ambos |
 | `ssh_ls` | `path` (string, default: home) | No |
-| `ssh_read_file` | `path` (string) | Sí |
+| `ssh_read_file` | `path` (string), `offset` (number, línea inicial base 1), `limit` (number, máx. líneas) | `path` |
 | `ssh_write_file` | `path` (string), `content` (string) | Ambos |
 | `ssh_history` | `filter` ("all" \| "reversible" \| "reversed"), `limit` (number) | No |
 | `ssh_undo` | `recordId` (number), `confirm` (boolean) | `recordId` |
@@ -279,7 +279,7 @@ Cada operación ejecutada durante una conexión activa se registra en memoria. E
 |-----------|:----------:|------------------------|
 | `ssh_write_file` | Sí | Restaura contenido previo. Si no existía, elimina el archivo |
 | `ssh_upload` | Sí | Restaura contenido previo remoto. Si no existía, elimina el archivo |
-| `ssh_download` | Sí | Elimina el archivo local descargado |
+| `ssh_download` | Sí | Restaura contenido local previo. Si no existía localmente, elimina el archivo |
 | `ssh_exec` | No | Se registra pero no es auto-reversible |
 | `ssh_exec_interactive` | No | Se registra pero no es auto-reversible |
 | `ssh_read_file` | N/A | Solo lectura, nada que revertir |
@@ -311,7 +311,7 @@ Este servidor implementa **capas de seguridad complementarias**. Es importante e
 ### Limitaciones del historial y undo
 
 - El historial y la capacidad de undo **se pierden al reiniciar el servidor MCP** (el historial vive en memoria).
-- El undo de archivos escribe usando codificación UTF-8. **No es confiable para archivos binarios** (imágenes, certificados, etc.).
+- **Los archivos binarios** (detectados via null bytes) **son excluidos del backup de undo completamente** — el undo es solo UTF-8.
 - El undo **no es atómico**: si el proceso muere a mitad de la escritura de restauración, el archivo puede quedar truncado.
 - El contenido previo de archivos mayores a 512 KB no se almacena — el undo mostrará error en ese caso.
 - El historial mantiene un máximo de 100 entradas. Las más antiguas se descartan automáticamente.
@@ -368,15 +368,15 @@ Ejemplo:
 - **SFTP:** Inicialización lazy — se crea al primer uso y se reutiliza. Se auto-invalida si el subsistema SFTP cierra o genera error (`sftp.on('close'/'error')`).
 - **Exec Interactivo:** Usa `exec()` con `pty: true` para comandos que requieren input interactivo. Soporta auto-respuesta a prompts via regex. Los patrones regex del usuario se validan con `safe-regex2` antes de compilar para prevenir ReDoS. Settle timeout (2s) detecta la finalización; timeout global (default 30s) previene bloqueos.
 - **Sesiones Shell:** Usa `shell()` con PTY para terminales interactivos persistentes. Máximo 5 sesiones concurrentes. Auto-cierre tras 5 minutos de inactividad. Buffer limitado a 1MB. Todas las sesiones se cierran en `ssh_disconnect`. Los códigos ANSI se eliminan del output.
-- **Timeout de exec:** Todas las llamadas internas `ssh exec` corren contra un timeout de 30s. El stdout se trunca a 1MB. Usa `cat -- path` y `rm -f -- path` para proteger contra nombres de archivo que empiecen con `-`.
+- **Timeout de exec:** Todas las llamadas internas `ssh exec` corren contra un timeout de 30s. stdout y stderr se truncan a 1MB con truncación per-chunk durante la acumulación. Exit codes no-cero sin stderr resuelven con anotación `[exit code: N]` en vez de rechazar (preserva comportamiento de `grep`/`diff`). Usa `cat -- path` y `rm -f -- path` para proteger contra nombres de archivo que empiecen con `-`.
 - **Clamping de timeout:** Los timeouts del usuario se restringen a un mínimo de 1s y máximo de 5 minutos.
 - **Validación de inputs:** Centralizada en `validation.ts`. Todos los argumentos de tools pasan por helpers tipados (`requireString`, `optionalBoolean`, etc.).
-- **Lectura de archivos:** Usa `ssh exec cat` (no SFTP) para archivos de texto.
+- **Lectura de archivos:** Usa `ssh exec cat` (no SFTP) para archivos de texto. Soporta lectura parcial via `offset` (línea inicial, base 1) y `limit` (máx. líneas) usando `sed -n`.
 - **Escritura de archivos:** Usa SFTP `createWriteStream` para soporte de archivos grandes.
 - **Escape de argumentos:** Shell escaping con comillas simples para prevenir inyección de comandos.
-- **Audit logging:** No bloqueante. Patrones comunes de secretos (`password=`, `token=`, `Bearer`, etc.) se redactan antes de escribir. Archivo creado con permisos `0o600`. Respuestas con `sensitive: true` se registran como `[REDACTED]`. Requiere rotación externa (logrotate) para producción.
+- **Audit logging:** No bloqueante. Patrones comunes de secretos (`password=`, `token=`, `Bearer`, etc.) se redactan antes de escribir. Archivo creado con permisos `0o600`. Respuestas con `sensitive: true` se registran como `[REDACTED]`. Todas las operaciones de tools son auditadas, incluyendo `ssh_ls`. Shutdown graceful via handler `beforeExit` para flush de escrituras pendientes. Requiere rotación externa (logrotate) para producción.
 - **Cache de perfiles:** `profiles.json` se lee y valida completamente al arranque (todos los campos requeridos + llave legible). Cambios requieren reiniciar el servidor MCP.
-- **Historial de operaciones:** Máximo 100 entradas en memoria. `previousContent` no se almacena si supera 512KB. El historial se limpia al conectar/desconectar.
+- **Historial de operaciones:** Máximo 100 entradas en memoria. `ssh_download` preserva archivos locales pre-existentes via undo tipo `local_file_restore`. Archivos binarios (detección de null bytes) son excluidos del backup de undo. `previousContent` no se almacena si supera 512KB. El historial se limpia al conectar/desconectar.
 - **Sandbox local:** `ssh_download`, `ssh_upload` y `ssh_undo` (borrado local) verifican que la ruta resolta esté dentro del `localSandboxDir` del perfil activo.
 
 ---

@@ -3,3 +3,4 @@ dist/
 .env
 audit.log
 profiles.json
+docs/

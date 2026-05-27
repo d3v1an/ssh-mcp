@@ -26,7 +26,6 @@ export interface ShellSession {
   id: string;
   channel: import("ssh2").ClientChannel;
   buffer: string;
-  createdAt: Date;
   lastActivity: Date;
   idleTimer: ReturnType<typeof setTimeout>;
 }
@@ -37,7 +36,6 @@ export interface ReverseInfo {
   remotePath?: string;
   localPath?: string;
   previousContent?: string;
-  previousExisted?: boolean;
 }
 
 export interface CommandRecord {
