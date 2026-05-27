@@ -2,7 +2,10 @@ export interface SSHProfile {
   host: string;
   port: number;
   username: string;
-  password?: string;
+  privateKey: Buffer;
+  passphrase?: string;
+  hostFingerprint: string;
+  localSandboxDir: string;
 }
 
 export interface AuditEntry {

@@ -3,7 +3,7 @@ import { Tool } from "@modelcontextprotocol/sdk/types.js";
 export const tools: Tool[] = [
   {
     name: "ssh_list_profiles",
-    description: "Lista los perfiles de servidores SSH disponibles (sin mostrar passwords)",
+    description: "Lista los perfiles de servidores SSH disponibles (incluye host, port, username y privateKeyPath; nunca expone la llave privada ni la passphrase)",
     inputSchema: {
       type: "object",
       properties: {},
@@ -234,6 +234,11 @@ export const tools: Tool[] = [
           type: "boolean",
           description:
             "Confirmar ejecución de comandos peligrosos. Solo aplica cuando raw es false",
+        },
+        sensitive: {
+          type: "boolean",
+          description:
+            "Si es true, el input se registra como [REDACTED] en el audit log. Usar cuando se envíen contraseñas u otros secretos",
         },
       },
       required: ["sessionId", "input"],

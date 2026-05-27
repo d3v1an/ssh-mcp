@@ -9,14 +9,28 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client, SFTPWrapper } from "ssh2";
 import dotenv from "dotenv";
+import { createRequire } from "module";
+import { resolve, sep } from "path";
+import * as fs from "fs";
 
 import { tools } from "./tools.js";
 import { getProfile, listProfiles } from "./profiles.js";
 import { isDangerousCommand, AuditLogger } from "./security.js";
-import { PromptResponse, ShellSession, CommandRecord, ReverseInfo } from "./types.js";
-import * as fs from "fs";
+import { PromptResponse, ShellSession, CommandRecord, ReverseInfo, AuditEntry } from "./types.js";
+import { formatUptime, padRight, escapeShellArg, stripAnsi } from "./utils.js";
+import {
+  requireString,
+  optionalString,
+  optionalBoolean,
+  optionalNumber,
+  clampTimeout,
+} from "./validation.js";
+import safeRegex from "safe-regex2";
 
 dotenv.config();
+
+const _require = createRequire(import.meta.url);
+const { version: SERVER_VERSION } = _require("../package.json") as { version: string };
 
 class SSHMCPServer {
   private server: Server;
@@ -24,6 +38,8 @@ class SSHMCPServer {
   private sftpClient: SFTPWrapper | null = null;
   private currentProfile: string | null = null;
   private connectedAt: Date | null = null;
+  private connectedProfileMeta: { host: string; port: number; username: string } | null = null;
+  private localSandboxDir: string | null = null;
   private auditLogger: AuditLogger;
   private shellSessions: Map<string, ShellSession> = new Map();
   private sessionCounter = 0;
@@ -35,11 +51,13 @@ class SSHMCPServer {
   private static readonly SHELL_IDLE_TIMEOUT = 5 * 60_000;
   private static readonly MAX_SESSIONS = 5;
   private static readonly MAX_BUFFER = 1_024 * 1_024;
+  private static readonly MAX_HISTORY = 100;
+  private static readonly MAX_PREV_CONTENT = 512 * 1_024;
 
   constructor() {
     this.auditLogger = new AuditLogger();
     this.server = new Server(
-      { name: "ssh-mcp-server", version: "0.1.0" },
+      { name: "ssh-mcp-server", version: SERVER_VERSION },
       { capabilities: { tools: {} } }
     );
     this.setupHandlers();
@@ -107,14 +125,14 @@ class SSHMCPServer {
     };
   }
 
-  private async handleConnect(args: any): Promise<CallToolResult> {
+  private async handleConnect(args: unknown): Promise<CallToolResult> {
     if (this.sshClient) {
       throw new Error(
         `Ya hay una conexión activa al perfil "${this.currentProfile}". Desconecta primero con ssh_disconnect.`
       );
     }
 
-    const profileName = args.profile as string;
+    const profileName = requireString(args, "profile");
     const profile = getProfile(profileName);
 
     return new Promise<CallToolResult>((resolve, reject) => {
@@ -124,6 +142,12 @@ class SSHMCPServer {
         this.sshClient = client;
         this.currentProfile = profileName;
         this.connectedAt = new Date();
+        this.connectedProfileMeta = {
+          host: profile.host,
+          port: profile.port,
+          username: profile.username,
+        };
+        this.localSandboxDir = profile.localSandboxDir;
         this.commandHistory = [];
         this.recordCounter = 0;
 
@@ -144,11 +168,38 @@ class SSHMCPServer {
         reject(new Error(`Error conectando a "${profileName}": ${err.message}`));
       });
 
+      // Clean up state if connection drops unexpectedly after being established
+      client.on("close", () => {
+        if (this.sshClient === client) {
+          this.auditDirect("connection_dropped", this.currentProfile ?? "unknown", "error");
+          this.cleanupState();
+        }
+      });
+
+      client.on("end", () => {
+        if (this.sshClient === client) {
+          this.cleanupState();
+        }
+      });
+
       client.connect({
         host: profile.host,
         port: profile.port,
         username: profile.username,
-        password: profile.password,
+        privateKey: profile.privateKey,
+        passphrase: profile.passphrase,
+        hostHash: "sha256",
+        // fingerprint is a hex string; profile stores "SHA256:<base64>" from ssh-keygen -l
+        hostVerifier: (fingerprint: string): boolean => {
+          const base64Part = profile.hostFingerprint.startsWith("SHA256:")
+            ? profile.hostFingerprint.slice(7)
+            : profile.hostFingerprint;
+          const computed = Buffer.from(fingerprint, "hex").toString("base64").replace(/=+$/, "");
+          return computed === base64Part.replace(/=+$/, "");
+        },
+        keepaliveInterval: 30_000,
+        keepaliveCountMax: 3,
+        readyTimeout: 20_000,
       });
     });
   }
@@ -159,22 +210,16 @@ class SSHMCPServer {
     }
 
     const profileName = this.currentProfile;
+    const client = this.sshClient;
 
-    // Cerrar todas las sesiones de shell activas
-    for (const [id, session] of this.shellSessions) {
-      this.destroyShellSession(id, session);
+    // Audit shell session closures before state cleanup
+    for (const [id] of this.shellSessions) {
       this.audit("ssh_shell_close", `sessionId=${id} (disconnect cleanup)`, "ok");
     }
-
-    this.sftpClient = null;
-    this.sshClient.end();
-    this.sshClient = null;
-    this.currentProfile = null;
-    this.connectedAt = null;
-    this.commandHistory = [];
-    this.recordCounter = 0;
-
     this.audit("ssh_disconnect", `profile=${profileName}`, "ok");
+
+    this.cleanupState();
+    client.end();
 
     return {
       content: [{ type: "text", text: `Desconectado de "${profileName}".` }],
@@ -189,7 +234,7 @@ class SSHMCPServer {
     }
 
     const uptime = Math.floor((Date.now() - this.connectedAt.getTime()) / 1000);
-    const profile = getProfile(this.currentProfile);
+    const meta = this.connectedProfileMeta!;
 
     return {
       content: [
@@ -197,8 +242,8 @@ class SSHMCPServer {
           type: "text",
           text: [
             `Perfil: ${this.currentProfile}`,
-            `Host: ${profile.host}:${profile.port}`,
-            `Usuario: ${profile.username}`,
+            `Host: ${meta.host}:${meta.port}`,
+            `Usuario: ${meta.username}`,
             `Conectado hace: ${formatUptime(uptime)}`,
           ].join("\n"),
         },
@@ -206,33 +251,20 @@ class SSHMCPServer {
     };
   }
 
-  private async handleExec(args: any): Promise<CallToolResult> {
+  private async handleExec(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const command = args.command as string;
-    const confirm = args.confirm as boolean | undefined;
+    const command = requireString(args, "command");
+    const confirm = optionalBoolean(args, "confirm");
 
     const check = isDangerousCommand(command);
     if (check.dangerous && !confirm) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `ADVERTENCIA: Comando potencialmente destructivo detectado.`,
-              `Comando: ${command}`,
-              `Razón: ${check.reason}`,
-              ``,
-              `Para ejecutar este comando, reenvía con confirm: true.`,
-            ].join("\n"),
-          },
-        ],
-      };
+      return this.dangerWarning(command, check.reason);
     }
 
     try {
       const output = await this.execCommand(command);
       this.audit("ssh_exec", command, "ok");
-      this.recordOperation("ssh_exec", { command, confirm }, output, false);
+      this.recordOperation("ssh_exec", { command }, output, false);
       return {
         content: [{ type: "text", text: output || "(sin salida)" }],
       };
@@ -243,15 +275,18 @@ class SSHMCPServer {
     }
   }
 
-  private async handleUpload(args: any): Promise<CallToolResult> {
+  private async handleUpload(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const { localPath, remotePath } = args as { localPath: string; remotePath: string };
+    const localPath = requireString(args, "localPath");
+    const remotePath = requireString(args, "remotePath");
 
-    // Capturar estado previo antes de subir
+    this.validateLocalPath(localPath);
+
+    // Capture previous remote state for undo
     let previousContent: string | undefined;
     let previousExisted = true;
     try {
-      previousContent = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
+      previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
     } catch {
       previousExisted = false;
     }
@@ -271,7 +306,7 @@ class SSHMCPServer {
                 type: "file_restore",
                 description: `Restaurar contenido previo de ${remotePath}`,
                 remotePath,
-                previousContent,
+                previousContent: this.capPrevContent(previousContent),
                 previousExisted: true,
               }
             : {
@@ -285,7 +320,7 @@ class SSHMCPServer {
             "ssh_upload",
             { localPath, remotePath },
             `Archivo subido: ${localPath} -> ${remotePath}`,
-            true,
+            previousExisted ? reverseInfo.previousContent !== undefined : true,
             reverseInfo
           );
 
@@ -299,9 +334,12 @@ class SSHMCPServer {
     });
   }
 
-  private async handleDownload(args: any): Promise<CallToolResult> {
+  private async handleDownload(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const { remotePath, localPath } = args as { remotePath: string; localPath: string };
+    const remotePath = requireString(args, "remotePath");
+    const localPath = requireString(args, "localPath");
+
+    this.validateLocalPath(localPath);
 
     const sftp = await this.getSftp();
 
@@ -335,9 +373,9 @@ class SSHMCPServer {
     });
   }
 
-  private async handleLs(args: any): Promise<CallToolResult> {
+  private async handleLs(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const path = (args.path as string) || ".";
+    const path = optionalString(args, "path") || ".";
 
     const sftp = await this.getSftp();
 
@@ -361,12 +399,12 @@ class SSHMCPServer {
     });
   }
 
-  private async handleReadFile(args: any): Promise<CallToolResult> {
+  private async handleReadFile(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const remotePath = args.path as string;
+    const remotePath = requireString(args, "path");
 
     try {
-      const content = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
+      const content = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
       this.audit("ssh_read_file", remotePath, "ok");
       this.recordOperation("ssh_read_file", { path: remotePath }, `(${content.length} bytes leídos)`, false);
       return {
@@ -379,15 +417,16 @@ class SSHMCPServer {
     }
   }
 
-  private async handleWriteFile(args: any): Promise<CallToolResult> {
+  private async handleWriteFile(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const { path: remotePath, content } = args as { path: string; content: string };
+    const remotePath = requireString(args, "path");
+    const content = requireString(args, "content");
 
-    // Capturar estado previo antes de escribir
+    // Capture previous state for undo
     let previousContent: string | undefined;
     let previousExisted = true;
     try {
-      previousContent = await this.execCommand(`cat ${escapeShellArg(remotePath)}`);
+      previousContent = await this.execCommand(`cat -- ${escapeShellArg(remotePath)}`);
     } catch {
       previousExisted = false;
     }
@@ -400,12 +439,13 @@ class SSHMCPServer {
       stream.on("close", () => {
         this.audit("ssh_write_file", remotePath, "ok");
 
+        const capped = this.capPrevContent(previousContent);
         const reverseInfo: ReverseInfo = previousExisted
           ? {
               type: "file_restore",
               description: `Restaurar contenido previo de ${remotePath}`,
               remotePath,
-              previousContent,
+              previousContent: capped,
               previousExisted: true,
             }
           : {
@@ -419,7 +459,7 @@ class SSHMCPServer {
           "ssh_write_file",
           { path: remotePath, content: `(${content.length} bytes)` },
           `Archivo escrito: ${remotePath} (${content.length} bytes)`,
-          true,
+          previousExisted ? capped !== undefined : true,
           reverseInfo
         );
 
@@ -441,37 +481,29 @@ class SSHMCPServer {
 
   // --- Interactive & Shell handlers ---
 
-  private async handleExecInteractive(args: any): Promise<CallToolResult> {
+  private async handleExecInteractive(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const command = args.command as string;
-    const responses = (args.responses || []) as PromptResponse[];
-    const timeout = (args.timeout as number) || SSHMCPServer.EXEC_TIMEOUT;
-    const confirm = args.confirm as boolean | undefined;
+    const command = requireString(args, "command");
+    const responses = ((args as Record<string, unknown>)?.responses ?? []) as PromptResponse[];
+    const timeout = clampTimeout(optionalNumber(args, "timeout"), SSHMCPServer.EXEC_TIMEOUT);
+    const confirm = optionalBoolean(args, "confirm");
 
     const check = isDangerousCommand(command);
     if (check.dangerous && !confirm) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `ADVERTENCIA: Comando potencialmente destructivo detectado.`,
-              `Comando: ${command}`,
-              `Razón: ${check.reason}`,
-              ``,
-              `Para ejecutar este comando, reenvía con confirm: true.`,
-            ].join("\n"),
-          },
-        ],
-      };
+      return this.dangerWarning(command, check.reason);
     }
 
-    // Compilar regex de prompts
-    const compiledResponses = responses.map((r) => ({
-      regex: new RegExp(r.prompt),
-      answer: r.answer,
-      sensitive: r.sensitive || false,
-    }));
+    // Validate regex patterns for ReDoS safety before compiling
+    const compiledResponses = responses.map((r) => {
+      const re = new RegExp(r.prompt);
+      if (!safeRegex(re)) {
+        throw new Error(
+          `Patrón de prompt inseguro (puede causar ReDoS): "${r.prompt}". ` +
+            `Usa patrones simples sin cuantificadores anidados.`
+        );
+      }
+      return { regex: re, answer: r.answer, sensitive: r.sensitive || false };
+    });
 
     const auditResponses = responses
       .map((r) => (r.sensitive ? `${r.prompt}:[REDACTED]` : `${r.prompt}:${r.answer}`))
@@ -533,12 +565,10 @@ class SSHMCPServer {
           const chunk = data.toString();
           output += chunk;
 
-          // Truncar buffer si excede el máximo
           if (output.length > SSHMCPServer.MAX_BUFFER) {
             output = output.slice(-SSHMCPServer.MAX_BUFFER);
           }
 
-          // Verificar si algún prompt match
           for (const resp of compiledResponses) {
             if (resp.regex.test(chunk)) {
               stream.write(resp.answer + "\n");
@@ -563,7 +593,7 @@ class SSHMCPServer {
     });
   }
 
-  private async handleShellStart(args: any): Promise<CallToolResult> {
+  private async handleShellStart(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
 
     if (this.shellSessions.size >= SSHMCPServer.MAX_SESSIONS) {
@@ -572,8 +602,8 @@ class SSHMCPServer {
       );
     }
 
-    const cols = (args?.cols as number) || 80;
-    const rows = (args?.rows as number) || 24;
+    const cols = optionalNumber(args, "cols") ?? 80;
+    const rows = optionalNumber(args, "rows") ?? 24;
 
     return new Promise<CallToolResult>((resolve, reject) => {
       this.sshClient!.shell({ cols, rows, term: "xterm" }, (err, stream) => {
@@ -595,7 +625,6 @@ class SSHMCPServer {
 
         stream.on("data", (data: Buffer) => {
           session.buffer += data.toString();
-          // Truncar buffer si excede el máximo
           if (session.buffer.length > SSHMCPServer.MAX_BUFFER) {
             session.buffer = session.buffer.slice(-SSHMCPServer.MAX_BUFFER);
           }
@@ -612,7 +641,6 @@ class SSHMCPServer {
         this.shellSessions.set(sessionId, session);
         this.audit("ssh_shell_start", `sessionId=${sessionId}`, "ok");
 
-        // Esperar el banner/prompt inicial
         setTimeout(() => {
           resolve({
             content: [
@@ -634,20 +662,20 @@ class SSHMCPServer {
     });
   }
 
-  private async handleShellSend(args: any): Promise<CallToolResult> {
+  private async handleShellSend(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const sessionId = args.sessionId as string;
-    const input = args.input as string;
-    const raw = (args.raw as boolean) || false;
-    const timeout = (args.timeout as number) || SSHMCPServer.SETTLE_TIMEOUT;
-    const confirm = args.confirm as boolean | undefined;
+    const sessionId = requireString(args, "sessionId");
+    const input = requireString(args, "input");
+    const raw = optionalBoolean(args, "raw") ?? false;
+    const timeout = clampTimeout(optionalNumber(args, "timeout"), SSHMCPServer.SETTLE_TIMEOUT);
+    const confirm = optionalBoolean(args, "confirm");
+    const sensitive = optionalBoolean(args, "sensitive") ?? false;
 
     const session = this.shellSessions.get(sessionId);
     if (!session) {
       throw new Error(`Sesión "${sessionId}" no encontrada. Usa ssh_shell_start para crear una.`);
     }
 
-    // Security check cuando no es raw
     if (!raw) {
       const check = isDangerousCommand(input);
       if (check.dangerous && !confirm) {
@@ -668,17 +696,15 @@ class SSHMCPServer {
       }
     }
 
-    // Limpiar buffer antes de enviar
     session.buffer = "";
 
-    // Enviar input
     const data = raw ? input : input + "\n";
     session.channel.write(data);
 
     this.resetIdleTimer(sessionId, session);
-    this.audit("ssh_shell_send", `sessionId=${sessionId} input=${raw ? "(raw)" : input}`, "ok");
+    const auditInput = sensitive ? "[REDACTED]" : raw ? "(raw)" : input;
+    this.audit("ssh_shell_send", `sessionId=${sessionId} input=${auditInput}`, "ok");
 
-    // Esperar output
     return new Promise<CallToolResult>((resolve) => {
       setTimeout(() => {
         resolve({
@@ -693,17 +719,16 @@ class SSHMCPServer {
     });
   }
 
-  private async handleShellRead(args: any): Promise<CallToolResult> {
+  private async handleShellRead(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const sessionId = args.sessionId as string;
-    const timeout = (args.timeout as number) || SSHMCPServer.SETTLE_TIMEOUT;
+    const sessionId = requireString(args, "sessionId");
+    const timeout = clampTimeout(optionalNumber(args, "timeout"), SSHMCPServer.SETTLE_TIMEOUT);
 
     const session = this.shellSessions.get(sessionId);
     if (!session) {
       throw new Error(`Sesión "${sessionId}" no encontrada.`);
     }
 
-    // Esperar output adicional
     return new Promise<CallToolResult>((resolve) => {
       setTimeout(() => {
         const output = session.buffer;
@@ -720,9 +745,9 @@ class SSHMCPServer {
     });
   }
 
-  private async handleShellClose(args: any): Promise<CallToolResult> {
+  private async handleShellClose(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const sessionId = args.sessionId as string;
+    const sessionId = requireString(args, "sessionId");
 
     const session = this.shellSessions.get(sessionId);
     if (!session) {
@@ -746,6 +771,11 @@ class SSHMCPServer {
     reversible: boolean,
     reverseInfo?: ReverseInfo
   ): void {
+    // Evict oldest entry when cap is reached
+    if (this.commandHistory.length >= SSHMCPServer.MAX_HISTORY) {
+      this.commandHistory.shift();
+    }
+
     this.commandHistory.push({
       id: ++this.recordCounter,
       timestamp: new Date().toISOString(),
@@ -758,10 +788,10 @@ class SSHMCPServer {
     });
   }
 
-  private handleHistory(args: any): CallToolResult {
+  private handleHistory(args: unknown): CallToolResult {
     this.requireConnection();
-    const filter = (args?.filter as string) || "all";
-    const limit = (args?.limit as number) || 20;
+    const filter = optionalString(args, "filter") || "all";
+    const limit = optionalNumber(args, "limit") ?? 20;
 
     let records = [...this.commandHistory];
 
@@ -801,24 +831,22 @@ class SSHMCPServer {
     };
   }
 
-  private async handleUndo(args: any): Promise<CallToolResult> {
+  private async handleUndo(args: unknown): Promise<CallToolResult> {
     this.requireConnection();
-    const recordId = args.recordId as number;
-    const confirm = args.confirm as boolean | undefined;
+    const recordId = optionalNumber(args, "recordId");
+    if (recordId === undefined) throw new Error(`Parámetro requerido "recordId" debe ser un número`);
+    const confirm = optionalBoolean(args, "confirm");
 
     const record = this.commandHistory.find((r) => r.id === recordId);
     if (!record) {
       throw new Error(`Registro #${recordId} no encontrado en el historial.`);
     }
-
     if (!record.reversible) {
       throw new Error(`Registro #${recordId} (${record.tool}) no es reversible.`);
     }
-
     if (record.reversed) {
       throw new Error(`Registro #${recordId} ya fue revertido.`);
     }
-
     if (!record.reverseInfo) {
       throw new Error(`Registro #${recordId} no tiene información de reversión.`);
     }
@@ -843,6 +871,11 @@ class SSHMCPServer {
 
     switch (info.type) {
       case "file_restore": {
+        if (info.previousContent === undefined) {
+          throw new Error(
+            `Registro #${recordId}: el contenido previo no fue almacenado (archivo demasiado grande). Undo no disponible.`
+          );
+        }
         const sftp = await this.getSftp();
         await new Promise<void>((resolve, reject) => {
           const stream = sftp.createWriteStream(info.remotePath!);
@@ -863,7 +896,7 @@ class SSHMCPServer {
       }
 
       case "file_delete": {
-        await this.execCommand(`rm ${escapeShellArg(info.remotePath!)}`);
+        await this.execCommand(`rm -f -- ${escapeShellArg(info.remotePath!)}`);
         record.reversed = true;
         this.audit("ssh_undo", `record=${recordId} file_delete ${info.remotePath}`, "ok");
         return {
@@ -877,6 +910,7 @@ class SSHMCPServer {
       }
 
       case "local_file_delete": {
+        this.validateLocalPath(info.localPath!);
         if (fs.existsSync(info.localPath!)) {
           fs.unlinkSync(info.localPath!);
         }
@@ -921,12 +955,64 @@ class SSHMCPServer {
     this.shellSessions.delete(sessionId);
   }
 
+  // --- Connection state ---
+
+  private cleanupState(): void {
+    for (const [id, session] of this.shellSessions) {
+      clearTimeout(session.idleTimer);
+      session.channel.destroy();
+      this.shellSessions.delete(id);
+    }
+    this.sftpClient = null;
+    this.sshClient = null;
+    this.currentProfile = null;
+    this.connectedAt = null;
+    this.connectedProfileMeta = null;
+    this.localSandboxDir = null;
+    this.commandHistory = [];
+    this.recordCounter = 0;
+  }
+
   // --- Helpers ---
 
   private requireConnection(): void {
     if (!this.sshClient) {
       throw new Error("No hay conexión activa. Usa ssh_connect primero.");
     }
+  }
+
+  private validateLocalPath(localPath: string): void {
+    const sandbox = this.localSandboxDir ?? resolve(process.cwd());
+    const target = resolve(localPath);
+    if (target !== sandbox && !target.startsWith(sandbox + sep)) {
+      throw new Error(
+        `Ruta local "${localPath}" fuera del directorio permitido "${sandbox}". ` +
+          `Configura "localSandboxDir" en el perfil de profiles.json para ampliar el acceso.`
+      );
+    }
+  }
+
+  private capPrevContent(content: string | undefined): string | undefined {
+    if (content === undefined) return undefined;
+    if (content.length > SSHMCPServer.MAX_PREV_CONTENT) return undefined;
+    return content;
+  }
+
+  private dangerWarning(command: string, reason: string): CallToolResult {
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            `ADVERTENCIA: Comando potencialmente destructivo detectado.`,
+            `Comando: ${command}`,
+            `Razón: ${reason}`,
+            ``,
+            `Para ejecutar este comando, reenvía con confirm: true.`,
+          ].join("\n"),
+        },
+      ],
+    };
   }
 
   private async getSftp(): Promise<SFTPWrapper> {
@@ -937,6 +1023,10 @@ class SSHMCPServer {
         if (err) {
           reject(new Error(`Error iniciando SFTP: ${err.message}`));
         } else {
+          // Invalidate cached client if the SFTP subsystem closes or errors
+          const invalidate = () => { this.sftpClient = null; };
+          sftp.on("close", invalidate);
+          sftp.on("error", invalidate);
           this.sftpClient = sftp;
           resolve(sftp);
         }
@@ -944,8 +1034,8 @@ class SSHMCPServer {
     });
   }
 
-  private execCommand(command: string): Promise<string> {
-    return new Promise((resolve, reject) => {
+  private execCommand(command: string, timeoutMs = SSHMCPServer.EXEC_TIMEOUT): Promise<string> {
+    const exec = new Promise<string>((resolve, reject) => {
       this.sshClient!.exec(command, (err, stream) => {
         if (err) {
           reject(err);
@@ -957,6 +1047,9 @@ class SSHMCPServer {
 
         stream.on("data", (data: Buffer) => {
           stdout += data.toString();
+          if (stdout.length > SSHMCPServer.MAX_BUFFER) {
+            stdout = stdout.slice(-SSHMCPServer.MAX_BUFFER);
+          }
         });
 
         stream.stderr.on("data", (data: Buffer) => {
@@ -972,6 +1065,15 @@ class SSHMCPServer {
         });
       });
     });
+
+    const timer = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Timeout ejecutando comando (${timeoutMs}ms)`)),
+        timeoutMs
+      )
+    );
+
+    return Promise.race([exec, timer]);
   }
 
   private audit(tool: string, params: string, result: "ok" | "error"): void {
@@ -984,39 +1086,21 @@ class SSHMCPServer {
     });
   }
 
+  private auditDirect(tool: string, profile: string, result: "ok" | "error"): void {
+    this.auditLogger.log({
+      timestamp: new Date().toISOString(),
+      profile,
+      tool,
+      params: `profile=${profile}`,
+      result,
+    } as AuditEntry);
+  }
+
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
     console.error("SSH MCP Server iniciado");
   }
-}
-
-// --- Utility functions ---
-
-function formatUptime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  const parts: string[] = [];
-  if (h > 0) parts.push(`${h}h`);
-  if (m > 0) parts.push(`${m}m`);
-  parts.push(`${s}s`);
-  return parts.join(" ");
-}
-
-function padRight(str: string, len: number): string {
-  return str + " ".repeat(Math.max(0, len - str.length));
-}
-
-function escapeShellArg(arg: string): string {
-  return "'" + arg.replace(/'/g, "'\\''") + "'";
-}
-
-// eslint-disable-next-line no-control-regex
-const ANSI_REGEX = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nq-uy=><~]/g;
-
-function stripAnsi(str: string): string {
-  return str.replace(ANSI_REGEX, "");
 }
 
 const server = new SSHMCPServer();

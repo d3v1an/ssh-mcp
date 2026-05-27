@@ -6,7 +6,7 @@
 ![SSH2](https://img.shields.io/badge/SSH2-1.16-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 [![npm](https://img.shields.io/npm/v/s01-ssh-mcp)](https://www.npmjs.com/package/s01-ssh-mcp)
-![Version](https://img.shields.io/badge/Version-0.3.1-green)
+![Version](https://img.shields.io/badge/Version-0.4.0-green)
 
 [Read in English](README.md)
 
@@ -50,7 +50,7 @@ graph TB
 flowchart TD
     Start([Inicio]) --> ListProfiles["ssh_list_profiles<br/>Ver perfiles disponibles"]
     ListProfiles --> Connect["ssh_connect<br/>(nombre del perfil)"]
-    Connect -->|Password no encontrado| Error["Error: variable de entorno<br/>SSH_PASSWORD_NOMBRE faltante"]
+    Connect -->|Llave inválida o no encontrada| Error["Error: privateKeyPath faltante<br/>o passphrase incorrecta"]
     Connect -->|OK| Active["Conexión Activa<br/>(1 perfil a la vez)"]
 
     Active --> ExecBranch["ssh_exec<br/>(comando)"]
@@ -103,15 +103,18 @@ flowchart LR
 ```text
 s01_ssh_mcp/
 \u251c\u2500\u2500 src/
-\u2502   \u251c\u2500\u2500 index.ts       # Clase SSHMCPServer — router de tools, lógica SSH, handlers interactivos/shell
-\u2502   \u251c\u2500\u2500 tools.ts       # Definición de las 17 tools MCP (schemas JSON)
-\u2502   \u251c\u2500\u2500 profiles.ts    # Carga de perfiles + inyección de passwords desde env
-\u2502   \u251c\u2500\u2500 security.ts    # Detección de comandos peligrosos + AuditLogger
-\u2502   \u2514\u2500\u2500 types.ts       # Interfaces: SSHProfile, AuditEntry, PromptResponse, ShellSession, CommandRecord, ReverseInfo
-\u251c\u2500\u2500 dist/              # Output compilado (generado por tsc)
-\u251c\u2500\u2500 profiles.json      # Configuración de servidores SSH
-\u251c\u2500\u2500 .env               # Passwords (no versionado)
-\u251c\u2500\u2500 audit.log          # Log de auditoría (generado en runtime)
+\u2502   \u251c\u2500\u2500 index.ts        # Clase SSHMCPServer — router de tools, lógica SSH, handlers interactivos/shell
+\u2502   \u251c\u2500\u2500 tools.ts        # Definición de las 17 tools MCP (schemas JSON)
+\u2502   \u251c\u2500\u2500 profiles.ts     # Carga de perfiles + lectura de llave privada desde disco e inyección de passphrase desde env
+\u2502   \u251c\u2500\u2500 security.ts     # Detección de comandos peligrosos + AuditLogger (redacción de secretos, perms 0o600)
+\u2502   \u251c\u2500\u2500 types.ts        # Interfaces: SSHProfile, AuditEntry, PromptResponse, ShellSession, CommandRecord, ReverseInfo
+\u2502   \u251c\u2500\u2500 utils.ts        # Utilidades puras: formatUptime, padRight, escapeShellArg, stripAnsi
+\u2502   \u2514\u2500\u2500 validation.ts   # Validación de inputs: requireString, optionalString/Boolean/Number, clampTimeout
+\u251c\u2500\u2500 dist/               # Output compilado (generado por tsc)
+\u251c\u2500\u2500 profiles.json       # Configuración de servidores SSH (no versionado)
+\u251c\u2500\u2500 profiles.json.example  # Plantilla de perfiles (incluida en el paquete npm)
+\u251c\u2500\u2500 .env                # Passphrases opcionales de llaves (no versionado)
+\u251c\u2500\u2500 audit.log           # Log de auditoría (generado en runtime)
 \u251c\u2500\u2500 package.json
 \u2514\u2500\u2500 tsconfig.json
 ```
@@ -122,33 +125,56 @@ s01_ssh_mcp/
 
 ### 1. Perfiles de servidores
 
-Editar `profiles.json`:
+Copiar `profiles.json.example` → `profiles.json` y ajustar cada campo. El archivo **no debe versionarse** (está en `.gitignore`).
+
+Campos requeridos:
+
+| Campo | Descripción |
+|-------|-------------|
+| `host` | IP o hostname del servidor |
+| `port` | Puerto SSH (normalmente `22`) |
+| `username` | Usuario SSH |
+| `privateKeyPath` | Ruta a la llave privada. Soporta `~` |
+| `hostFingerprint` | Fingerprint SHA-256 del host (ver abajo) |
+
+Campos opcionales:
+
+| Campo | Descripción | Default |
+|-------|-------------|---------|
+| `localSandboxDir` | Directorio local donde se permiten descargas/uploads. Soporta `~` | Directorio de trabajo del proceso |
 
 ```json
 {
   "produccion": {
     "host": "192.168.1.100",
     "port": 22,
-    "username": "deploy"
-  },
-  "staging": {
-    "host": "192.168.1.101",
-    "port": 22,
-    "username": "deploy"
+    "username": "deploy",
+    "privateKeyPath": "~/.ssh/id_ed25519_produccion",
+    "hostFingerprint": "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
+    "localSandboxDir": "~/descargas-mcp"
   }
 }
 ```
 
-### 2. Passwords
-
-Crear `.env` (copiar de `.env.example`):
-
+**Obtener el fingerprint del host:**
 ```bash
-SSH_PASSWORD_PRODUCCION=tu_password
-SSH_PASSWORD_STAGING=tu_password
+ssh-keyscan -t ed25519 HOST 2>/dev/null | ssh-keygen -lf -
+# Salida: 256 SHA256:AbCd... host (ED25519)
+# Copiar la parte "SHA256:..." al campo hostFingerprint
 ```
 
-El formato es `SSH_PASSWORD_<NOMBRE_PERFIL_UPPERCASE>`.
+> **Importante:** La autenticación por password fue eliminada. Solo se admite autenticación por llave SSH. Asegúrate de que el servidor remoto tenga la llave pública correspondiente en `~/.ssh/authorized_keys` y que `PasswordAuthentication no` esté configurado en `sshd_config`.
+
+### 2. Passphrases (opcional)
+
+Si tus llaves privadas están protegidas con passphrase, definirlas en `.env`:
+
+```bash
+SSH_PASSPHRASE_PRODUCCION=tu_passphrase
+SSH_PASSPHRASE_STAGING=tu_passphrase
+```
+
+El formato es `SSH_PASSPHRASE_<NOMBRE_PERFIL_UPPERCASE>`. Si la llave no tiene passphrase, omitir la variable.
 
 ### 3. Build y ejecución
 
@@ -171,8 +197,8 @@ No requiere instalación local — solo agregar en la configuración de Claude D
       "command": "npx",
       "args": ["-y", "s01-ssh-mcp"],
       "env": {
-        "SSH_PASSWORD_PRODUCCION": "tu_password",
-        "SSH_PASSWORD_STAGING": "tu_password"
+        "SSH_PASSPHRASE_PRODUCCION": "tu_passphrase_si_aplica",
+        "SSH_PASSPHRASE_STAGING": "tu_passphrase_si_aplica"
       }
     }
   }
@@ -188,8 +214,8 @@ No requiere instalación local — solo agregar en la configuración de Claude D
       "command": "node",
       "args": ["/ruta/a/s01_ssh_mcp/dist/index.js"],
       "env": {
-        "SSH_PASSWORD_PRODUCCION": "tu_password",
-        "SSH_PASSWORD_STAGING": "tu_password"
+        "SSH_PASSPHRASE_PRODUCCION": "tu_passphrase_si_aplica",
+        "SSH_PASSPHRASE_STAGING": "tu_passphrase_si_aplica"
       }
     }
   }
@@ -204,7 +230,7 @@ No requiere instalación local — solo agregar en la configuración de Claude D
 
 | Tool | Descripción | Requiere conexión |
 | ---- | ----------- | :-----------------: |
-| `ssh_list_profiles` | Listar perfiles configurados (sin passwords) | No  |
+| `ssh_list_profiles` | Listar perfiles configurados (incluye `privateKeyPath`, sin exponer llave ni passphrase) | No  |
 | `ssh_connect` | Conectar a un perfil SSH | No  |
 | `ssh_disconnect` | Cerrar la conexión SSH activa (cierra todas las shell sessions) | Sí |
 | `ssh_status` | Estado de conexión (perfil, host, uptime) | Sí |
@@ -230,7 +256,7 @@ No requiere instalación local — solo agregar en la configuración de Claude D
 | `ssh_exec` | `command` (string), `confirm` (boolean) | `command` |
 | `ssh_exec_interactive` | `command` (string), `responses[]` ({prompt, answer, sensitive}), `timeout` (number), `confirm` (boolean) | `command` |
 | `ssh_shell_start` | `cols` (number, default: 80), `rows` (number, default: 24) | No |
-| `ssh_shell_send` | `sessionId` (string), `input` (string), `raw` (boolean), `timeout` (number), `confirm` (boolean) | `sessionId`, `input` |
+| `ssh_shell_send` | `sessionId` (string), `input` (string), `raw` (boolean), `timeout` (number), `confirm` (boolean), `sensitive` (boolean) | `sessionId`, `input` |
 | `ssh_shell_read` | `sessionId` (string), `timeout` (number) | `sessionId` |
 | `ssh_shell_close` | `sessionId` (string) | `sessionId` |
 | `ssh_upload` | `localPath` (string), `remotePath` (string) | Ambos |
@@ -266,9 +292,39 @@ El historial se limpia en `ssh_connect` y `ssh_disconnect`.
 
 ## Seguridad
 
+### Modelo de seguridad
+
+Este servidor implementa **capas de seguridad complementarias**. Es importante entender qué cubre cada una y cuáles son sus límites:
+
+| Capa | Qué protege | Límite |
+|------|-------------|--------|
+| **Autenticación por llave SSH** | Solo conecta con llave privada configurada | No protege si la llave es robada |
+| **Verificación de host (MITM)** | Rechaza servidores que no coincidan con el fingerprint configurado | Requiere configurar `hostFingerprint` correctamente |
+| **Sandbox local** | Restringe `ssh_download`/`ssh_upload`/`ssh_undo` a un directorio | No aplica a operaciones remotas |
+| **Detección de comandos peligrosos** | Advierte sobre patrones destructivos conocidos | **Capa de aviso, NO de seguridad.** Evadible via obfuscación, variables, `eval`, `raw: true` en shell |
+| **Redacción en audit log** | Oculta patrones comunes de secretos en el log | No detecta todos los formatos posibles de secretos |
+
+> **Recomendación de defensa en profundidad:** El servidor solo es tan seguro como el usuario SSH remoto. Configura el usuario con permisos mínimos necesarios, usa `sudoers` restrictivo, y mantén `PasswordAuthentication no` en `sshd_config`.
+
+> **Nota sobre `raw: true` en `ssh_shell_send`:** Este modo envía el input directamente al shell sin ninguna validación de comandos peligrosos. Es intencional para casos de uso avanzados (secuencias de control, REPL internos). Usar con precaución.
+
+### Limitaciones del historial y undo
+
+- El historial y la capacidad de undo **se pierden al reiniciar el servidor MCP** (el historial vive en memoria).
+- El undo de archivos escribe usando codificación UTF-8. **No es confiable para archivos binarios** (imágenes, certificados, etc.).
+- El undo **no es atómico**: si el proceso muere a mitad de la escritura de restauración, el archivo puede quedar truncado.
+- El contenido previo de archivos mayores a 512 KB no se almacena — el undo mostrará error en ese caso.
+- El historial mantiene un máximo de 100 entradas. Las más antiguas se descartan automáticamente.
+
+### Caché de perfiles
+
+`profiles.json` se lee una vez al arranque y se cachea en memoria. **Cambios en el archivo requieren reiniciar el servidor MCP** para que surtan efecto.
+
 ### Detección de comandos destructivos
 
 Los siguientes patrones son interceptados y requieren `confirm: true` para ejecutarse. Aplica a `ssh_exec`, `ssh_exec_interactive`, y `ssh_shell_send` (cuando `raw: false`):
+
+> **Nota:** Esta detección es una capa de aviso, no una barrera de seguridad. No depender de ella como única protección contra acciones destructivas.
 
 | Patrón | Razón |
 | ------- | ----- |
@@ -306,14 +362,22 @@ Ejemplo:
 ## Detalles Técnicos
 
 - **Transporte MCP:** stdio (JSON-RPC sobre stdin/stdout)
-- **Conexión SSH:** Una conexión activa a la vez. Intentar conectar a otro perfil sin desconectar genera error.
-- **SFTP:** Inicialización lazy — se crea al primer uso de una operación de archivos y se reutiliza.
+- **Conexión SSH:** Una conexión activa a la vez. Intentar conectar a otro perfil sin desconectar genera error. Keepalive: intervalo 30s, máximo 3 reintentos, timeout de conexión 20s.
+- **Verificación de host:** Cada `ssh_connect` verifica el fingerprint remoto con `hostHash: "sha256"` + `hostVerifier`. Convierte el fingerprint hex de ssh2 a base64 y lo compara con el valor `SHA256:<base64>` del perfil. La conexión se rechaza si no coinciden.
+- **Limpieza de conexión:** Los eventos `close` y `end` del SSH triggean `cleanupState()` en desconexiones inesperadas, cerrando todas las sesiones y el estado SFTP. Las desconexiones intencionales están protegidas contra doble limpieza.
+- **SFTP:** Inicialización lazy — se crea al primer uso y se reutiliza. Se auto-invalida si el subsistema SFTP cierra o genera error (`sftp.on('close'/'error')`).
+- **Exec Interactivo:** Usa `exec()` con `pty: true` para comandos que requieren input interactivo. Soporta auto-respuesta a prompts via regex. Los patrones regex del usuario se validan con `safe-regex2` antes de compilar para prevenir ReDoS. Settle timeout (2s) detecta la finalización; timeout global (default 30s) previene bloqueos.
+- **Sesiones Shell:** Usa `shell()` con PTY para terminales interactivos persistentes. Máximo 5 sesiones concurrentes. Auto-cierre tras 5 minutos de inactividad. Buffer limitado a 1MB. Todas las sesiones se cierran en `ssh_disconnect`. Los códigos ANSI se eliminan del output.
+- **Timeout de exec:** Todas las llamadas internas `ssh exec` corren contra un timeout de 30s. El stdout se trunca a 1MB. Usa `cat -- path` y `rm -f -- path` para proteger contra nombres de archivo que empiecen con `-`.
+- **Clamping de timeout:** Los timeouts del usuario se restringen a un mínimo de 1s y máximo de 5 minutos.
+- **Validación de inputs:** Centralizada en `validation.ts`. Todos los argumentos de tools pasan por helpers tipados (`requireString`, `optionalBoolean`, etc.).
 - **Lectura de archivos:** Usa `ssh exec cat` (no SFTP) para archivos de texto.
 - **Escritura de archivos:** Usa SFTP `createWriteStream` para soporte de archivos grandes.
 - **Escape de argumentos:** Shell escaping con comillas simples para prevenir inyección de comandos.
-- **Audit logging:** No bloqueante — errores de escritura al log se ignoran para no interrumpir operaciones.
-- **Cache de perfiles:** `profiles.json` se lee una vez y se cachea en memoria.
-- **Historial de operaciones:** Todas las operaciones se registran en memoria durante la conexión activa. Las operaciones de archivos (`ssh_write_file`, `ssh_upload`) capturan el contenido previo antes de modificar, permitiendo undo. El historial se limpia al conectar/desconectar.
+- **Audit logging:** No bloqueante. Patrones comunes de secretos (`password=`, `token=`, `Bearer`, etc.) se redactan antes de escribir. Archivo creado con permisos `0o600`. Respuestas con `sensitive: true` se registran como `[REDACTED]`. Requiere rotación externa (logrotate) para producción.
+- **Cache de perfiles:** `profiles.json` se lee y valida completamente al arranque (todos los campos requeridos + llave legible). Cambios requieren reiniciar el servidor MCP.
+- **Historial de operaciones:** Máximo 100 entradas en memoria. `previousContent` no se almacena si supera 512KB. El historial se limpia al conectar/desconectar.
+- **Sandbox local:** `ssh_download`, `ssh_upload` y `ssh_undo` (borrado local) verifican que la ruta resolta esté dentro del `localSandboxDir` del perfil activo.
 
 ---
 

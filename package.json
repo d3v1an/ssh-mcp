@@ -1,6 +1,6 @@
 {
   "name": "s01-ssh-mcp",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "MCP Server for SSH remote server administration",
   "main": "dist/index.js",
   "bin": {
@@ -8,7 +8,7 @@
   },
   "files": [
     "dist",
-    "profiles.json",
+    "profiles.json.example",
     ".env.example",
     "README.md",
     "README.es.md",
@@ -35,6 +35,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "dotenv": "^16.4.5",
+    "safe-regex2": "^5.1.1",
     "ssh2": "^1.16.0"
   },
   "devDependencies": {

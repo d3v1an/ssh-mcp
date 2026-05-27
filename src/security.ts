@@ -1,4 +1,4 @@
-import { appendFileSync } from "fs";
+import { appendFileSync, openSync, closeSync } from "fs";
 import { join } from "path";
 import { AuditEntry } from "./types.js";
 
@@ -21,6 +21,29 @@ const DANGEROUS_PATTERNS: { pattern: RegExp; reason: string }[] = [
   { pattern: /\biptables\s+-F/, reason: "flush de reglas de firewall" },
 ];
 
+// Redact common secret patterns before writing to audit log
+const REDACT_PATTERNS: { re: RegExp; label: string }[] = [
+  { re: /password\s*=\s*\S+/gi, label: "password=" },
+  { re: /passwd\s*=\s*\S+/gi, label: "passwd=" },
+  { re: /token\s*=\s*\S+/gi, label: "token=" },
+  { re: /secret\s*=\s*\S+/gi, label: "secret=" },
+  { re: /api[_-]?key\s*=\s*\S+/gi, label: "api_key=" },
+  { re: /Authorization:\s*\S+/gi, label: "Authorization:" },
+  { re: /Bearer\s+\S+/gi, label: "Bearer" },
+];
+
+function redactSensitive(text: string): string {
+  let result = text;
+  for (const { re } of REDACT_PATTERNS) {
+    result = result.replace(re, (match) => {
+      const sep = match.indexOf("=") !== -1 ? "=" : ":";
+      const idx = match.indexOf(sep);
+      return idx !== -1 ? match.slice(0, idx + 1) + " [REDACTED]" : "[REDACTED]";
+    });
+  }
+  return result;
+}
+
 export function isDangerousCommand(cmd: string): { dangerous: boolean; reason: string } {
   for (const { pattern, reason } of DANGEROUS_PATTERNS) {
     if (pattern.test(cmd)) {
@@ -35,10 +58,18 @@ export class AuditLogger {
 
   constructor(logPath?: string) {
     this.logPath = logPath || join(process.cwd(), "audit.log");
+    // Ensure file exists with restrictive permissions (owner read/write only)
+    try {
+      const fd = openSync(this.logPath, "a", 0o600);
+      closeSync(fd);
+    } catch {
+      // Silently ignore — audit writes will also fail silently below
+    }
   }
 
   log(entry: AuditEntry): void {
-    const line = `[${entry.timestamp}] [${entry.profile}] [${entry.tool}] [${entry.params}] [RESULT: ${entry.result}]\n`;
+    const params = redactSensitive(entry.params);
+    const line = `[${entry.timestamp}] [${entry.profile}] [${entry.tool}] [${params}] [RESULT: ${entry.result}]\n`;
     try {
       appendFileSync(this.logPath, line, "utf-8");
     } catch {

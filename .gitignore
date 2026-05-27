@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 audit.log
+profiles.json

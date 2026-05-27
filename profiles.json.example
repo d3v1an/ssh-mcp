@@ -4,7 +4,7 @@
     "port": 22,
     "username": "deploy",
     "privateKeyPath": "~/.ssh/id_ed25519_produccion",
-    "hostFingerprint": "SHA256:REEMPLAZA_CON_TU_FINGERPRINT_REAL",
+    "hostFingerprint": "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
     "localSandboxDir": "~/descargas-mcp"
   },
   "staging": {
@@ -12,7 +12,7 @@
     "port": 22,
     "username": "deploy",
     "privateKeyPath": "~/.ssh/id_ed25519_staging",
-    "hostFingerprint": "SHA256:REEMPLAZA_CON_TU_FINGERPRINT_REAL",
+    "hostFingerprint": "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd",
     "localSandboxDir": "~/descargas-mcp"
   }
 }
