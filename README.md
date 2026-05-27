@@ -8,7 +8,7 @@
 [![npm](https://img.shields.io/npm/v/s01-ssh-mcp)](https://www.npmjs.com/package/s01-ssh-mcp)
 ![Version](https://img.shields.io/badge/Version-0.5.0-green)
 
-[Leer en Espa\u00f1ol](README.es.md)
+[Leer en Español](README.es.md)
 
 MCP (Model Context Protocol) server for remote server administration via SSH. Supports multiple profiles, remote command execution, interactive commands (PTY), persistent shell sessions, file transfer (SFTP), destructive command detection with audit logging, and operation history with undo capabilities.
 

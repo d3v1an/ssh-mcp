@@ -102,21 +102,21 @@ flowchart LR
 
 ```text
 s01_ssh_mcp/
-\u251c\u2500\u2500 src/
-\u2502   \u251c\u2500\u2500 index.ts        # Clase SSHMCPServer — router de tools, lógica SSH, handlers interactivos/shell
-\u2502   \u251c\u2500\u2500 tools.ts        # Definición de las 17 tools MCP (schemas JSON)
-\u2502   \u251c\u2500\u2500 profiles.ts     # Carga de perfiles + lectura de llave privada desde disco e inyección de passphrase desde env
-\u2502   \u251c\u2500\u2500 security.ts     # Detección de comandos peligrosos + AuditLogger (redacción de secretos, perms 0o600)
-\u2502   \u251c\u2500\u2500 types.ts        # Interfaces: SSHProfile, AuditEntry, PromptResponse, ShellSession, CommandRecord, ReverseInfo
-\u2502   \u251c\u2500\u2500 utils.ts        # Utilidades puras: formatUptime, padRight, escapeShellArg, stripAnsi
-\u2502   \u2514\u2500\u2500 validation.ts   # Validación de inputs: requireString, optionalString/Boolean/Number, clampTimeout
-\u251c\u2500\u2500 dist/               # Output compilado (generado por tsc)
-\u251c\u2500\u2500 profiles.json       # Configuración de servidores SSH (no versionado)
-\u251c\u2500\u2500 profiles.json.example  # Plantilla de perfiles (incluida en el paquete npm)
-\u251c\u2500\u2500 .env                # Passphrases opcionales de llaves (no versionado)
-\u251c\u2500\u2500 audit.log           # Log de auditoría (generado en runtime)
-\u251c\u2500\u2500 package.json
-\u2514\u2500\u2500 tsconfig.json
+├── src/
+│   ├── index.ts        # Clase SSHMCPServer — router de tools, lógica SSH, handlers interactivos/shell
+│   ├── tools.ts        # Definición de las 17 tools MCP (schemas JSON)
+│   ├── profiles.ts     # Carga de perfiles + lectura de llave privada desde disco e inyección de passphrase desde env
+│   ├── security.ts     # Detección de comandos peligrosos + AuditLogger (redacción de secretos, perms 0o600)
+│   ├── types.ts        # Interfaces: SSHProfile, AuditEntry, PromptResponse, ShellSession, CommandRecord, ReverseInfo
+│   ├── utils.ts        # Utilidades puras: formatUptime, padRight, escapeShellArg, stripAnsi
+│   └── validation.ts   # Validación de inputs: requireString, optionalString/Boolean/Number, clampTimeout
+├── dist/               # Output compilado (generado por tsc)
+├── profiles.json       # Configuración de servidores SSH (no versionado)
+├── profiles.json.example  # Plantilla de perfiles (incluida en el paquete npm)
+├── .env                # Passphrases opcionales de llaves (no versionado)
+├── audit.log           # Log de auditoría (generado en runtime)
+├── package.json
+└── tsconfig.json
 ```
 
 ---
