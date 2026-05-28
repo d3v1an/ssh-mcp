@@ -163,6 +163,8 @@ ssh-keyscan -t ed25519 HOST 2>/dev/null | ssh-keygen -lf -
 # Copy the "SHA256:..." part into hostFingerprint
 ```
 
+> **Note:** `hostFingerprint` is the identity of the **remote server**, not your local key. The command above asks the server for its public key — it does not involve any of your private keys. If you have multiple profiles pointing to the same server with different keys, `hostFingerprint` will be identical across all of them. Your local key is specified in `privateKeyPath`.
+
 > **Important:** Password authentication has been removed. Only SSH key authentication is supported. Make sure the remote server has the matching public key in `~/.ssh/authorized_keys` and enforce `PasswordAuthentication no` in `sshd_config`.
 
 ### 2. Passphrases (optional)

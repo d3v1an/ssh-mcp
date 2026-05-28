@@ -163,6 +163,8 @@ ssh-keyscan -t ed25519 HOST 2>/dev/null | ssh-keygen -lf -
 # Copiar la parte "SHA256:..." al campo hostFingerprint
 ```
 
+> **Nota:** `hostFingerprint` es la identidad del **servidor remoto**, no de tu llave local. El comando anterior le pregunta al servidor su clave pública — no involucra ninguna de tus llaves privadas. Si tienes múltiples perfiles que apuntan al mismo servidor con diferentes llaves, el `hostFingerprint` será idéntico en todos ellos. Tu llave local se especifica en `privateKeyPath`.
+
 > **Importante:** La autenticación por password fue eliminada. Solo se admite autenticación por llave SSH. Asegúrate de que el servidor remoto tenga la llave pública correspondiente en `~/.ssh/authorized_keys` y que `PasswordAuthentication no` esté configurado en `sshd_config`.
 
 ### 2. Passphrases (opcional)

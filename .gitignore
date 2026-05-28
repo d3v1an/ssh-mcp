@@ -4,3 +4,4 @@ dist/
 audit.log
 profiles.json
 docs/
+.DS_Store
